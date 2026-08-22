@@ -1,25 +1,41 @@
 # rm — paideia-as build manifest
 #
-# Wave: R50  Milestone: M1 (design + skeleton)
+# Wave: R50  Milestone: M5 (1.0 signed release)
 # Doc:   design/tooling/r49-r50-plan.md §5.8 in the paideia-os repo.
 #
 # Consumed by `paideia-as build`. Each line is a directive; blank lines
-# and lines starting with `#` are ignored. The M1 format mirrors
-# pkg/manifest.pdxproj — one target, one entry point, a source list,
-# a dep list, and the caps-manifest that ships in the packaged binary.
+# and lines starting with `#` are ignored. The M5 format extends the
+# M1-M3 shape with three release-time directives (pdxdoc, manifest_sig,
+# changelog) that `paideia-as release --sign` consumes to produce the
+# dual-signed pkg.tar per design/tooling/plan.md §9.3.
 # paideia-as v0.33+ is the required toolchain floor (mov_b narrow-load
 # mnemonic + @align attribute on .bss slots per the #1248 mitigation).
 #
 # The build produces one output file at build-out/rm (the elaborated
 # .pdx → ELF-like Paideia binary) plus a caps-manifest copy at
-# build-out/rm.caps for the InitCap sidecar packaging step at M5.
+# build-out/rm.caps that is packed alongside the .pdxdoc, the changelog
+# entry, and the dual-signed manifest.pdxsig into the .release tree
+# (see .release/mirror.pdxmeta for the layout that lands in
+# pkgs.paideia-os/main/).
 
-name        = rm
-version     = 0.3.0-m3
-kind        = tool
-entry       = RmMain::rm_main
-output      = build-out/rm
-caps_decl   = caps.decl
+name          = rm
+version       = 1.0.0
+kind          = tool
+entry         = RmMain::rm_main
+output        = build-out/rm
+caps_decl     = caps.decl
+
+# --- M5 release-time directives (design/tooling/plan.md §D4 + §9.3) ---
+# pdxdoc        The man-equivalent long-form doc (`doc rm` renders this).
+# manifest_sig  Path to the dual-signed manifest that ships in pkg.tar
+#               (author_pk + paideia_root_pk, both ML-DSA-65 per D1.a).
+# changelog     The v1.0.0 entry that `pkg info rm` surfaces.
+# mirror_meta   Metadata `pkg push` consumes to land pkg.tar into
+#               pkgs.paideia-os/main/rm/1.0.0/ (§6.3).
+pdxdoc        = doc/rm.pdxdoc
+manifest_sig  = manifest.pdxsig
+changelog     = CHANGELOG.md
+mirror_meta   = .release/mirror.pdxmeta
 
 # --- Source list (order-insensitive; paideia-as resolves module deps
 # from `module <Basename> = structure { ... }` headers). -----------------

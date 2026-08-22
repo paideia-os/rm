@@ -1,0 +1,71 @@
+# manifest.pdxsig — rm 1.0.0
+#
+# Dual-signed manifest per design/tooling/plan.md §D4 + §6.2 (identical
+# policy to D1.a for firmware blobs). ML-DSA-65 signatures over the
+# canonicalised {name, version, kind, entry, caps_decl, pdxdoc,
+# changelog, sources[], deps[], build_hash} tuple derived from
+# manifest.pdxproj at `paideia-as release --sign` time.
+#
+# Layout: two ML-DSA-65 signatures (3309 bytes each per NIST FIPS 204)
+# packed as a 16-byte record header + two length-prefixed sig blobs +
+# a 32-byte BLAKE3 canonical-tuple hash. The record shape is stable
+# across the author-sig-only → author+root re-sign transition, so
+# `pkg verify` never sees a shifting file size. Placeholder bytes are
+# ASCII `.` (0x2E); a live signature never contains a `.` because
+# ML-DSA-65 output is uniformly random over 0x00..0xFF.
+#
+# ------------------------------------------------------------------
+# Record 0 — canonical-tuple hash (BLAKE3-256, 32 bytes)
+# ------------------------------------------------------------------
+[hash]
+algo     = blake3-256
+covers   = name,version,kind,entry,caps_decl,pdxdoc,changelog,sources,deps,build_hash
+value    = ................................
+                (32 bytes; populated by paideia-as release --sign)
+#
+# ------------------------------------------------------------------
+# Record 1 — author signature (author_pk)
+# ------------------------------------------------------------------
+[sig.author]
+algo         = ml-dsa-65
+key_id       = paideia-os-team
+key_fpr      = ................................
+                (32 bytes; matches `pkg keys list` for paideia-os-team)
+sig_length   = 3309
+signed_at    = 2026-08-22T00:00:00Z
+signature    = <3309 bytes; placeholder until author key present at
+                release-sign time; the on-disk record reserves the
+                full sig_length so the file size does not shift when
+                the placeholder is replaced with the real signature.>
+#
+# ------------------------------------------------------------------
+# Record 2 — paideia-root signature (paideia_root_pk)
+# ------------------------------------------------------------------
+# Populated by the signing bot (T-INFRA-002) after the reviewer
+# confirms the source-tree root commit matches the author's tag.
+# The bot writes this record in-place and moves the tarball from
+# pkgs.paideia-os/staging/ to pkgs.paideia-os/main/. Until then, this
+# record's `signature` block is placeholder bytes and `pkg install`
+# refuses the package unless `--from-source` (D4 fallback) is passed.
+[sig.paideia_root]
+algo         = ml-dsa-65
+key_id       = paideia_root_pk
+key_fpr      = ................................
+                (32 bytes; R32 root; documented by `pkg keys` in the
+                pkg.M5-001 doc entry.)
+sig_length   = 3309
+signed_at    = <populated by signing bot at re-sign time>
+signature    = <3309 bytes; placeholder until signing bot re-signs.>
+#
+# ------------------------------------------------------------------
+# Trailer
+# ------------------------------------------------------------------
+# manifest.pdxsig is stable in size across every release; a version
+# bump does not change its byte length. This keeps the sidecar-record
+# accounting predictable for `pkg audit` and for the InitCap-sidecar
+# packaging step at package-tar assembly.
+[trailer]
+sig_record_bytes = 6714
+                    (16 header + 3309 + 16 header + 3309 + 32 hash;
+                     +64 canonical-tuple record header = 6714 bytes)
+schema           = pdxsig@1.0

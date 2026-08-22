@@ -1,0 +1,135 @@
+@name         rm
+@version      1.0.0
+@category     coreutil
+@wave         R50
+@repo         github.com/paideia-os/rm
+@license      MIT
+
+@synopsis
+  rm [-r|-f|-v|--wipe|--dry-run] <path>...
+
+@description
+  Remove one or more filesystem entries. Every entry is journaled to a
+  per-user trash subtree inside a PdxFS v1 transaction before it stops
+  being reachable by name, so a removal within the retention window
+  (default 24 hours) is fully reversible by `undo` — the invariant I5
+  (design/tooling/plan.md §4.2) rm exists to demonstrate.
+
+  --wipe overrides the journal path: the trash entry is unlinked at
+  once and the underlying storage is byte-overwritten where the device
+  supports it. A --wipe removal is intentionally not reversible; a
+  positive was_wiped audit flag lets a forensic reader distinguish an
+  intentional shred from a later retention reap.
+
+@options
+  -r, --recursive
+       Descend into directories leaf-first inside the same TXN.
+       Every entry is trash-moved individually so `undo` can partial-
+       replay by walking the schema stream in reverse.
+
+  -f, --force
+       Skip per-file confirmation. At v1.0 rm has no stdin binding and
+       every non-`-f` removal is treated as `-f` after emitting a
+       stdout note under -v; the interactive prompt lands with the
+       shell.M3 stdin plumbing wave.
+
+  -v, --verbose
+       Emit a per-target line naming the observable action (would
+       remove … / rm: … / recursive walk of … / shred: …) and every
+       decision the removal took (retention deadline, confirmation
+       skip, elevate refusal).
+
+  --wipe
+       Forensic shred (see @description). Skips the trash-subtree
+       journal, skips the undo record, stamps was_wiped=1 in the
+       RemoveRecord.
+
+  --dry-run
+       Emit what would happen and return EXIT_OK. Zero side effects
+       on the filesystem, on the audit stream, on the schema stream,
+       and on the undo log. The dry-run path is not a preview of a
+       forensic-detection-safe shred; --wipe --dry-run declines to
+       emit a wipe stub and prints the ordinary dry-run line.
+
+@differences-from-posix
+  * `rm` never prompts on a read-only file. Cap-check for
+    KIND_PDXFS_FILE(write,<target-parent>) is the sole authority.
+
+  * `rm -rf /` is not distinguished by pattern — the cap-check on
+    the root subtree denies the write and rm exits 4. There is no
+    heuristic hard-code of "/", "/*", or a similar list.
+
+  * Every removal is undoable within the retention window. POSIX rm
+    is destructive-on-return; Paideia rm returns before the trash
+    reaper has run and `undo` can reverse the last N invocations
+    (design/tooling/plan.md §I5).
+
+  * `--wipe` is the forensic path and is explicit. POSIX has no
+    portable shred; the closest ancestor is GNU shred(1) as a
+    separate binary. rm --wipe subsumes it under the same TXN
+    discipline.
+
+  * Every action goes through libpdx-audit before the trash-move.
+    A downstream reader of the RemoveRecord[] stream sees every
+    removal in emission order, not filesystem order.
+
+  * Targets under `/system/` (or crossing the invoker's subtree)
+    take a libpdx-elevate round-trip before proceeding. A refused
+    elevate skips the removal — no confirm hop, no print, no
+    retention or undo emit; the operator sees the refusal via the
+    rm_blocked_by_elevate counter surface.
+
+@exit-codes
+  0  Success (every target processed).
+  1  At least one target failed against the substrate.
+  2  Usage error (bad flag, missing positional).
+  3  System error (I/O, kernel refused, TXN aborted).
+  4  Capability denied (target-parent write cap missing, or a
+     --no-cap:… stripped the cap the request needs).
+  5  Signature verification failure (raised by pkg during install,
+     never by rm at run-time).
+
+@see
+  undo(1)   — reverse the last N rm invocations within the window.
+  cp(1)     — the mirror-image write path (also I5-journaled).
+  mv(1)     — cross-subtree rename (rm + cp under one TXN).
+  caps(1)   — inspect the caps rm requests via caps.decl.
+  pkg(1)    — install / upgrade rm via `pkg install rm`.
+  doc(1)    — read this file: `doc rm`.
+
+@examples
+  # Remove one file, verbose:
+  $ rm -v report.txt
+  rm: report.txt
+  rm: trash retention: 24h
+
+  # Remove a directory recursively:
+  $ rm -r stale/
+  rm: recursive walk of: stale
+  rm: 12 entries trash-moved (undo window: 24h)
+
+  # Preview a removal:
+  $ rm --dry-run -v secrets.txt
+  rm: would remove: secrets.txt
+
+  # Forensic shred:
+  $ rm --wipe -v scratch.key
+  rm: shred: scratch.key
+
+  # Reverse the last remove within the window:
+  $ undo
+  undo: rm -v report.txt  →  restored (deadline had 23h51m left)
+
+@ergonomics
+  Five most-common tasks, each ≤ 3 keystrokes past the target:
+    1. remove a file           →  rm  <path>
+    2. remove a tree           →  rm -r <path>
+    3. preview a removal       →  rm --dry-run <path>
+    4. shred (no undo)         →  rm --wipe <path>
+    5. undo the last removal   →  undo   (shipped by undo(1); rm's
+                                  RemoveRecord + undo record combine
+                                  to make this a one-word recovery.)
+
+@since 1.0.0
+  Initial signed release. Milestones M1-M5 landed 2026-08 across
+  issues #1-#17; see CHANGELOG.md for the per-milestone breakdown.

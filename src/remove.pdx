@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M3-004 (extends M3-003)
+// src/remove.pdx — rm.M5-001 (extends M3-004)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -141,18 +141,43 @@ module RmRemove = structure {
   //
   // Signature: remove_reset : () -> () !{mem, sysreg} @{cap}
   //
-  // At M3-001 this widens from a pure .bss zeroer (M1/M2) to a compound
-  // reset that also delegates to RmSchema::schema_reset. Subsequent M3
-  // commits extend the delegation list (audit_reset, undo_reset,
-  // elevate_reset). Effect tail widened to cover the callee tail sum.
+  // At M3-001 this widened from a pure .bss zeroer (M1/M2) to a compound
+  // reset that also delegates to RmSchema::schema_reset. M3-002/003/004
+  // extended the delegation list (audit_reset, undo_reset, elevate_reset).
+  //
+  // At M5-001 the umbrella closes the reset-list gap that the M4 tests
+  // flagged (tests/m4_001_txn_abort.pdx L57-64 + src/walk.pdx L98-105 +
+  // src/retention.pdx §retention_attach). Four .bss slots that a prior
+  // rm invocation could leave non-zero are added here so a re-entered
+  // process (M5 substrate lands a real umbrella loop) starts every run
+  // baseline:
+  //
+  //   * RmRetention::retention_attach_count  — bumped per non-wipe /
+  //     non-dry-run rm_process_one; a stale value would let a downstream
+  //     "did retention fire?" assertion misfire.
+  //   * RmRetention::retention_deadline_ns   — snapshot of the last
+  //     computed 24h deadline; RmUndo::undo_write reads it into the
+  //     6-lane undo record's retention lane. A stale value would carry
+  //     a previous invocation's deadline into a fresh undo record.
+  //   * RmWalk::walk_invocations             — bumped per walk_recursive
+  //     entry; M4 smoke reads removed_count + walk_invocations as an
+  //     accounting invariant (sum == pos_count).
+  //   * RmWalk::walk_blocked_by_elevate      — bumped when the walk
+  //     branch's top-level target is refused by libpdx-elevate; a stale
+  //     value would let an operator misread a fresh refusal.
+  //
+  // Adding these here also lets tests/m4_001_txn_abort.pdx L133-137
+  // drop its manual zeroing (retained as defensive idempotent lines
+  // until an M5 substrate PR moves them out).
   //
   // Prologue: sub rsp, 8 pad (entry rsp%16 == 8 → post-sub 0) for the
-  // nested schema_reset call. Matched add rsp, 8 before ret.
+  // four nested M3 resets. Matched add rsp, 8 before ret. r11 scratch
+  // for every .bss write. All immediates 0.
   // ============================================================================
   pub let remove_reset : () -> () !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M3-004 remove_reset (extended through M3). Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count) AND the new M3-004 rm_blocked_by_elevate counter, then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset, RmElevate::elevate_reset). Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema / RmAudit / RmUndo / RmElevate slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap, sched} to cover the M3 modules' declared effect surfaces (their resets themselves are !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the four nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
+      justification: "rm.M5-001 remove_reset (widens M3-004). Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count) AND the M3-004 rm_blocked_by_elevate counter AND the four M5-001 slots that close the reset-list gap M4-001 flagged (RmRetention::retention_attach_count, RmRetention::retention_deadline_ns, RmWalk::walk_invocations, RmWalk::walk_blocked_by_elevate), then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset, RmElevate::elevate_reset). RmRetention + RmWalk do not expose their own module reset — the four slots are the entirety of their observability surface, so the umbrella writes them directly rather than routing through a two-line callee. Delegation still keeps RmSchema/RmAudit/RmUndo/RmElevate .bss visibility internal. Effect tail !{mem, sysreg} @{cap, sched} unchanged from M3-004 (adding pure .bss writes here does not widen the callee tail sum). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the four nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write; each lea writes to its slot before the next lea replaces r11 (no overlap). All immediates 0.",
       block: {
         sub rsp, 8;                                 // rsp%16: 8 → 0
 
@@ -163,6 +188,20 @@ module RmRemove = structure {
         lea r11, [rip + rm_blocked_by_elevate];     mov [r11], rax;
         lea r11, [rip + RmWipe::was_wiped_flag];    mov [r11], rax;
         lea r11, [rip + RmWipe::wipe_count];        mov [r11], rax;
+
+        // M5-001: close the reset-list gap flagged in M4-001 —
+        // RmRetention (2 slots) + RmWalk (2 slots) had no module reset
+        // and were not covered by the M3 umbrella. Adding them here
+        // makes a re-entered rm process baseline in every slot the
+        // M4 smoke reads.
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov [r11], rax;
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov [r11], rax;
+        lea r11, [rip + RmWalk::walk_invocations];
+        mov [r11], rax;
+        lea r11, [rip + RmWalk::walk_blocked_by_elevate];
+        mov [r11], rax;
 
         // Delegate to M3 module resets (M3-001/002/003/004).
         call RmSchema::schema_reset;
