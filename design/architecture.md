@@ -198,3 +198,69 @@ manifest.pdxproj entry point, or the `RmMain::rm_main` signature.
 This is the load-bearing intent behind M1's shape: every subsequent
 milestone is a diff inside `RmRemove` or a new dependency, not a
 scaffolding change.
+
+## 8. M2 shape
+
+M2 lands the core-behaviour scope of §5.8 M2-001 through M2-004 in
+the plan doc: recursive `-r` walk, `-f` force flag (skip
+confirmation), 24h retention metadata on the trash-subtree entry, and
+`--wipe` immediate-unlink + best-effort byte-overwrite. Every M2
+milestone is a body edit inside `RmRemove::rm_process_one` (the M1
+single-target body, now extracted so the M2 iteration can dispatch
+to it per positional) or a new module the dispatch reaches from
+`RmRemove`. No M2 milestone edits `RmMain::rm_main`, changes the
+`caps.decl`, or introduces a new KIND.
+
+The M2 substrate note (from §6 above, restated): the mutating PdxFS
+ops (`sys_pdxfs_txn_open`, `sys_pdxfs_readdir`, `sys_pdxfs_move`,
+`sys_pdxfs_txn_commit`) are not in-tree at HEAD. Every M2 body ships
+the shape of the future syscall dispatch without inventing an outcome
+the substrate did not produce — the same discipline the mv.M1-003
+skeleton and the cp.M1-003 skeleton observe. When the substrate
+lands (R42-PREP-004 in the plan doc), the M2 stub tails become live
+syscall dispatches; no rm.M2 signature or caps.decl edit is needed.
+
+### 8.1 M2-001 recursive `-r` leaf-first walk (issue #4)
+
+`RmRemove::rm_remove_body` now iterates `ParsedArgs::pos_ptrs[0..
+pos_count]` and dispatches per-target on `flag_r`:
+
+- `flag_r == 0` → `RmRemove::rm_process_one(target)` (the extracted
+  M1-003 single-target body).
+- `flag_r == 1` → `RmWalk::walk_recursive(target)` (new module
+  `src/walk.pdx`).
+
+The rm_remove_body prologue is 2-push (r12=i, r13=pos_count) + `sub
+rsp, 8` = 24 bytes; entry rsp % 16 == 8, post-prologue rsp % 16 == 0
+for every nested call. The M1-era `target_ptr` argument RmMain still
+passes in rdi is now ignored — RmMain is unchanged (per §7's "no
+rework of rm_main" invariant), so rdi carries `pos_ptrs[0]` on entry
+which the M2 body reads back out of ParsedArgs anyway. This is a
+deliberate signature-freeze: the M1 → M2 transition is a body edit.
+
+`RmWalk::walk_recursive` is the M2 skeleton for the full-ripeness
+walk sequence (open one TXN → leaf-first tree walk → per-node move
+into `/system/pdxfs/trash/<uid>/<original-parent>/<name>` → single
+commit). At M2 it:
+
+- bumps `RmWalk::walk_invocations` so the smoke matrix can distinguish
+  a dispatched -r invocation from a bare fall-through;
+- emits a per-target four-part line: `(rm: )?recursive walk of:
+  <target>(\n | : (M2 stub -- real walk lands with PdxFS mutating
+  ops)\n)` (the newline branch is taken under `--dry-run`, the stub
+  branch otherwise);
+- returns `EXIT_OK` unconditionally.
+
+The register plan matches `RmRemove::rm_process_one`: 1-push (rbx)
+preserves target across the four `Print::print_str` calls, rdx is
+the NUL-walk cursor. This shape survives the substrate landing —
+the M2 stub tail becomes the syscall sequence in a body edit; the
+prologue, epilogue, and dispatch remain identical.
+
+**Walk-stack sizing note.** The full walk needs an explicit walk
+stack (recursion via CALL is not safe against a symlink-loop attack
+even inside a TXN). At M2 no such stack exists — the skeleton emits
+one line per top-level positional and terminates. The stack will
+land alongside the substrate ops as a bounded `.bss` array; the size
+bound (initial target: 4096 entries × 24 bytes = 96 KiB) is a §8.1
+addendum for the substrate-landing patch, not an M2 concern.

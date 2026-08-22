@@ -1,0 +1,219 @@
+// src/walk.pdx — rm.M2-001
+// RmWalk module: recursive `-r` leaf-first walk under a single TXN.
+//
+// Scope
+// -----
+// This module implements the -r flag's recursive-walk shape (paideia-
+// os design/tooling/r49-r50-plan.md §5.8 M2-001 line). When
+// `RmRemove::rm_remove_body` sees `flag_r == 1` and a positional
+// target, it dispatches to `walk_recursive(target)` here; on any
+// other flag combination (or a bare file target under -r) the
+// non-recursive path in RmRemove is used instead.
+//
+// The full-ripeness walk sequence (post-substrate landing) is:
+//
+//   (1) sys_pdxfs_txn_open(mode=MODIFY, snap_gen=<current>)
+//         → open one KIND_PDXFS_TXN cap that spans the WHOLE walk.
+//           Atomicity is the load-bearing invariant: a partial rm
+//           never leaves half-deleted state (see design/tooling/
+//           r49-r50-plan.md §4.8 undo/audit obligations).
+//   (2) push target onto an explicit walk stack.
+//   (3) while stack non-empty:
+//         node = pop
+//         if node is a directory:
+//           if node's readdir cursor is exhausted:
+//             sys_pdxfs_move(txn, node, /system/pdxfs/trash/<uid>/…)
+//           else:
+//             push node back (revisit after children)
+//             push each child (leaf-first ordering)
+//         else:
+//           sys_pdxfs_move(txn, node, trash-subtree)
+//   (4) sys_pdxfs_txn_commit(txn)
+//         → all trash-subtree moves durable atomically.
+//
+// M2-001 ships the SKELETON. The mutating PdxFS ops (open, move,
+// commit, readdir with a cursor) are R42 substrate work that has not
+// landed at HEAD (kernel exposes six QUERY_* ops on KIND_PDXFS_FILE
+// and six QUERY_* ops on KIND_PDXFS_TXN — see paideia-os src/kernel/
+// core/cap/kind_pdxfs_file.pdx L94-99 and kind_pdxfs_txn.pdx L91-96).
+// Rather than fake a walk, the M2 body:
+//
+//   * emits a per-target "recursive walk of: <target>: (M2 stub —
+//     real walk lands with PdxFS mutating ops)\n" line via
+//     Print::print_str (honouring flag_v as a "rm: " prefix and
+//     flag_dry_run as an alternate suffix path);
+//   * bumps a per-invocation counter (walk_invocations) so the M4
+//     smoke matrix can distinguish a real vs skeleton dispatch;
+//   * returns 0 (EXIT_OK) unconditionally.
+//
+// The dispatch shape survives the substrate landing: M2 body edits
+// swap the STUB tail for the txn_open / move / commit sequence, the
+// signature and prologue stay identical, and the caps.decl already
+// covers the four kinds the real walk touches (KIND_USER,
+// KIND_PDXFS_FILE, KIND_PDXFS_TXN, KIND_IPC_ENDPOINT — declared at
+// M1-001 and unchanged at M2 per the caps.decl doc block).
+//
+// See design/architecture.md §8.1 for the walk-stack sizing note (why
+// the max recursion depth at M2 is treated as an eventual .bss
+// concern, not an argv concern).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmWalk (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0 and single-byte char
+//     codes appear here).
+//   - r11 is scratch (used for every lea to the .rodata strings and
+//     the RmFlags .bss reads).
+//   - Byte reads use xor rax, rax; mov_b rax, [ptr] per the #1248
+//     mitigation (NUL-walk on the target).
+//   - walk_recursive prologue: 1-push (rbx) preserves target_ptr
+//     across up-to-four nested Print::print_str calls. Entry rsp %
+//     16 == 8; push brings it to 0 which satisfies the alignment
+//     invariant for the syscall-bearing print helper.
+
+module RmWalk = structure {
+
+  // -- Walk-invocation counter -----------------------------------------
+  // Bumped every time walk_recursive enters. Reset alongside
+  // removed_count in RmRemove::remove_reset — but the reset lives in
+  // that module because M1 already scoped its zeroing there; M2 adds
+  // this .bss slot and a matching zero in the same remove_reset path.
+  //
+  // At M2 this counter is the primary observability signal that a
+  // -r invocation was actually dispatched. The M4 smoke will read
+  // both removed_count and walk_invocations; the sum must equal
+  // pos_count if every positional was dispatched exactly once.
+  pub let mut walk_invocations : u64 = uninit @align(8)
+
+  // -- .rodata output pieces -------------------------------------------
+  // The walk emits a four-part line whose structure mirrors the
+  // rm_process_one shape: (optional "rm: ") + WALK_PREFIX + <target>
+  // + (dry-run "\n" | WALK_STUB_SUFFIX). The dry-run variant is
+  // deliberate: `-r --dry-run` at M2+ walks the subtree and prints
+  // one "would remove:" line per entry (design/argv-surface.md §3.2).
+  // At M2 the skeleton emits a single line per top-level target;
+  // real per-entry lines require live readdir which is substrate-
+  // dependent.
+
+  // "rm: " — mirror of RmRemove::VERBOSE_PREFIX so this module needs
+  // no cross-module dep on RmRemove for the verbose emit. Same 4
+  // bytes: 'r' 'm' ':' ' '.
+  pub let VERBOSE_PREFIX     : [u8; 4]   = "rm: "
+  pub let VERBOSE_PREFIX_LEN : u64       = 4
+
+  // "recursive walk of: " — the M2 walk-branch prefix. 19 bytes.
+  pub let WALK_PREFIX        : [u8; 19]  = "recursive walk of: "
+  pub let WALK_PREFIX_LEN    : u64       = 19
+
+  // "\n" — the trailing byte when flag_dry_run is set.
+  pub let NEWLINE            : [u8; 1]   = "\n"
+  pub let NEWLINE_LEN        : u64       = 1
+
+  // M2-scope stub suffix for the walk branch. Names the specific
+  // substrate gap (sys_pdxfs_txn_open + sys_pdxfs_readdir +
+  // sys_pdxfs_move + sys_pdxfs_txn_commit) so a user reading stdout
+  // under an M2 build sees exactly what is still absent.
+  pub let WALK_STUB_SUFFIX   : [u8; 55]  =
+    ": (M2 stub -- real walk lands with PdxFS mutating ops)\n"
+  pub let WALK_STUB_SUFFIX_LEN : u64     = 55
+
+  // ============================================================================
+  // walk_recursive(target_ptr) -> exit_code
+  //
+  // Signature: walk_recursive : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): target_ptr — VA of a NUL-terminated path (from
+  //                            ParsedArgs::pos_ptrs[i])
+  // RAX (output): 0 (EXIT_OK) at M2-001. Substrate-real error codes
+  //               (walk-open-fail, per-entry unlink-fail, commit-fail)
+  //               land with the PdxFS mutating ops.
+  //
+  // M2-001 body: bump walk_invocations, print the four-part walk
+  // line, return 0.
+  //
+  // Register plan (1-push prologue):
+  //   rbx = target_ptr  (preserved across up to four Print calls)
+  //   rdx = NUL-walk cursor for target-length compute
+  //   rax = byte / flag / call return scratch
+  //   rdi = print_str arg 1
+  //   rsi = print_str arg 2
+  //   r11 = lea scratch (for every .rodata + .bss access)
+  //
+  // Prologue: push rbx (rsp%16: 8 → 0). Epilogue: pop rbx, load
+  // rax=0, ret. Same shape as RmRemove::rm_process_one.
+  // ============================================================================
+  pub let walk_recursive : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.M2-001 walk_recursive skeleton. Bumps walk_invocations so the M4 smoke matrix can distinguish a dispatched -r invocation from a bare fall-through, then emits a per-target line: (optional 'rm: ') + 'recursive walk of: ' + <target> + ('\\n' | WALK_STUB_SUFFIX). No real filesystem walk; the mutating PdxFS ops (sys_pdxfs_txn_open, sys_pdxfs_readdir with cursor, sys_pdxfs_move, sys_pdxfs_txn_commit) are R42 substrate work not in-tree — see the mv.M1-003 preamble in mv/src/rename.pdx and the cp.M1-003 dispatch skeleton in cp/src/dispatch.pdx for the same substrate-gap discipline. 1-push prologue (rbx) preserves target_ptr across four nested Print::print_str calls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte chars. Every .bss / .rodata access via lea r11, [rip + sym]. Return: pop rbx, xor rax,rax, ret — always EXIT_OK at M2-001.",
+      block: {
+        // Prologue: preserve target_ptr across the four Print calls.
+        push rbx;                              // rsp%16: 8 → 0
+        mov rbx, rdi;                          // rbx = target_ptr
+
+        // Bump walk_invocations unconditionally so the counter records
+        // every -r dispatch, not every successful walk.
+        lea r11, [rip + walk_invocations];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
+        lea r11, [rip + RmFlags::flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je walk_skip_verbose;
+
+        lea rdi, [rip + VERBOSE_PREFIX];
+        mov rsi, 4;                            // VERBOSE_PREFIX_LEN
+        call Print::print_str;
+
+      walk_skip_verbose:
+        // ---- Part 2: "recursive walk of: " prefix (always) --------------
+        lea rdi, [rip + WALK_PREFIX];
+        mov rsi, 19;                           // WALK_PREFIX_LEN
+        call Print::print_str;
+
+        // ---- Part 3: print the target string ----------------------------
+        mov rdx, rbx;
+
+      walk_walk_target:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je walk_walk_done;
+        add rdx, 1;
+        jmp walk_walk_target;
+
+      walk_walk_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call Print::print_str;
+
+        // ---- Part 4: trailing suffix (dry-run → '\n'; else → WALK_STUB) -
+        lea r11, [rip + RmFlags::flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        je walk_print_stub;
+
+        // Dry-run: just a newline.
+        lea rdi, [rip + NEWLINE];
+        mov rsi, 1;                            // NEWLINE_LEN
+        call Print::print_str;
+        jmp walk_done_ok;
+
+      walk_print_stub:
+        lea rdi, [rip + WALK_STUB_SUFFIX];
+        mov rsi, 55;                           // WALK_STUB_SUFFIX_LEN
+        call Print::print_str;
+        // fallthrough
+
+      walk_done_ok:
+        // Epilogue: restore rbx, load exit code 0.
+        pop rbx;
+        xor rax, rax;                          // EXIT_OK
+        ret
+      }
+    }
+}

@@ -15,7 +15,7 @@
 # build-out/rm.caps for the InitCap sidecar packaging step at M5.
 
 name        = rm
-version     = 0.1.0-m1
+version     = 0.2.0-m2
 kind        = tool
 entry       = RmMain::rm_main
 output      = build-out/rm
@@ -26,7 +26,8 @@ caps_decl   = caps.decl
 sources:
   - src/print.pdx                 # sys_write(fd=1/2) helpers
   - src/flags.pdx                 # -r / -f / -v / --wipe / --dry-run scanner
-  - src/remove.pdx                # rm_remove body (M1: placeholder stub)
+  - src/remove.pdx                # rm_remove body (M2: iterate + dispatch)
+  - src/walk.pdx                  # RmWalk::walk_recursive (M2-001)
   - src/main.pdx                  # rm_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------

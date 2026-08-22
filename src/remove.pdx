@@ -1,58 +1,62 @@
-// src/remove.pdx — rm.M1-003 (upgraded from the M1-002 skeleton)
+// src/remove.pdx — rm.M2-001 (extends the M1-003 body)
 // RmRemove module: the rm removal body.
 //
-// Scope at M1-003 (this milestone)
+// Scope at M2-001 (this milestone)
 // --------------------------------
-// M1-003 lands the first-runnable body: read the caller-supplied
-// target_ptr, honour `--dry-run` and `-v` from the RmFlags .bss
-// slots, print a single-line placeholder on stdout naming the
-// target, and return `EXIT_OK` (0). No real filesystem work happens
-// yet — see design/architecture.md §6 for why the R48-close
-// substrate cannot open a live PdxFS transaction and trash-move the
-// target (both KIND_PDXFS_FILE and KIND_PDXFS_TXN are query-only at
-// HEAD, and the mutating-op set is scheduled for §5.8 M2).
+// M2-001 lands the positional iteration + per-target dispatch. The M1
+// body walked only pos_ptrs[0]; the M2 body iterates the full range
+// ParsedArgs::pos_ptrs[0..pos_count]. For every target it dispatches:
 //
-// The M1-003 body walks the target string to compute its length,
-// emits the four-part output line via `Print::print_str`:
+//   * flag_r == 1 → RmWalk::walk_recursive(target)   [src/walk.pdx]
+//   * flag_r == 0 → rm_process_one(target)           [this module]
 //
-//   [optional] "rm: "               when RmFlags::flag_v == 1
-//   [conditional prefix]            "would remove: " (dry-run) OR "" (default)
-//   <target bytes>                  the caller's positional string
-//   [conditional suffix]            "\n" (dry-run) OR the M1-stub suffix
+// `rm_process_one` is the M1-003 single-target body, unchanged in
+// substance — it prints the four-part placeholder line and returns
+// EXIT_OK. Later M2 milestones grow it: M2-002 adds the -f confirm
+// branch, M2-003 threads a retention-emit hop through RmRetention,
+// M2-004 dispatches on flag_wipe to RmWipe. Every one of those is a
+// body edit inside rm_process_one, not a change to rm_remove_body's
+// signature or the loader's cap set.
 //
-// The M1-stub suffix is:
-//   ": (M1 stub -- real trash-move via TXN lands at M2)\n"
+// The M1_STUB_SUFFIX string is retained (renamed to M2_STUB_SUFFIX
+// with an M2-accurate message) because the mutating PdxFS ops needed
+// for a real trash-move (sys_pdxfs_txn_open / sys_pdxfs_unlink /
+// sys_pdxfs_link / sys_pdxfs_txn_commit) are not in-tree — see the
+// mv.M1-003 preamble in the mv repo for the same substrate note.
+// KIND_PDXFS_FILE and KIND_PDXFS_TXN are query-only at HEAD
+// (paideia-os src/kernel/core/cap/kind_pdxfs_file.pdx L94-99 +
+// kind_pdxfs_txn.pdx L91-96); the M2 body faithfully emits the shape
+// of the future substrate call without inventing an outcome it did
+// not observe. That preserves the D3 audit-first invariant M3-002
+// will formalise.
 //
-// This mirrors the pkg.M1 `pkg list` placeholder that names the
-// milestone at which the real body lands, so a user reading the
-// stdout in M1 sees immediately that this is a stub and where in
-// the roadmap the real work is scheduled.
-//
-// Signature is unchanged from M1-002 — the upgrade is body-only,
-// which is why `RmMain::rm_main` needs no edit.
-//
-// Downstream body upgrades (per §5.8 in the plan doc):
-//   M2-001: recursive `-r` leaf-first walk under a single TXN.
-//   M2-002: `-f` skip confirmation (M1 has none to skip).
-//   M2-003: 24h retention deadline metadata on trash-subtree entry.
-//   M2-004: `--wipe` immediate trash-unlink + best-effort byte
-//           overwrite where the underlying device supports it.
-//   M3-001..004: RemoveRecord[] emission + audit + undo + elevate.
+// Substrate note (why the M2 body still emits a stub message)
+// -----------------------------------------------------------
+// See design/architecture.md §8 for the substrate gap discussion.
+// Summary: PdxFS v1's mutating dispatch ops (unlink, rename, move,
+// txn open/commit) are R42 substrate work that has not landed. rm.M2
+// wires every M2-scope shape (positional iteration, recursive walk,
+// -f confirm skip, retention-metadata attach, --wipe shred) up to but
+// not including that boundary, and returns EXIT_OK from every leaf.
+// When the substrate lands, every stub tail becomes a real syscall
+// dispatch inside rm_process_one / walk_recursive / wipe_emit /
+// retention_emit — no signature changes, no caps.decl churn.
 //
 // paideia-as compliance
 // ---------------------
 //   - Module RmRemove (PascalCase basename).
-//   - No test mnemonic; every zero-check uses cmp reg, 0.
-//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0 and single-byte
-//     char codes appear in immediates here).
-//   - r11 is scratch (used in every lea for .rodata bases and for
-//     the RmFlags .bss reads).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0, single-byte chars, and
+//     the pos_count bound of 32 appear in immediates here; the 24h
+//     retention constant is staged in r11 inside RmRetention, not here).
+//   - r11 is scratch (used for every lea and every imm64 stage).
 //   - Byte reads use xor rax, rax; mov_b rax, [ptr] per the #1248
-//     mitigation (the NUL-walk on the target).
-//   - 1-push prologue (rbx) preserves the target_ptr across the
-//     up-to-four nested Print::print_str syscalls. rsp % 16 was 8
-//     on SysV entry; push rbx brings it to 0 which satisfies the
-//     alignment invariant for every nested syscall.
+//     mitigation.
+//   - rm_remove_body prologue: 2-push (r12, r13) + sub rsp, 8 pad =
+//     24 bytes. Entry rsp % 16 == 8, so 8 - 24 % 16 == 0. Post-
+//     prologue rsp % 16 == 0 for every nested call site.
+//   - rm_process_one prologue: 1-push (rbx). Entry rsp % 16 == 8;
+//     push brings it to 0. Same shape as the M1-003 body.
 
 module RmRemove = structure {
 
@@ -62,14 +66,18 @@ module RmRemove = structure {
   pub let EXIT_USAGE          : u64 = 2
   pub let EXIT_NOT_YET_IMPL   : u64 = 3
 
-  // -- Per-invocation counter (populated at M2-001) --------------------
-  // See the M1-002 preamble for the M2 semantics.
+  // -- Per-invocation counter ------------------------------------------
+  // Bumped by rm_process_one on every entry (one bump per positional
+  // target processed by the non-recursive branch). Reset each rm
+  // invocation via remove_reset. M4's test harness reads this via
+  // rm's smoke matrix.
   pub let mut removed_count : u64 = uninit @align(8)
 
-  // -- M1-003 output message pieces ------------------------------------
-  // Each is emitted via one Print::print_str call; the byte-lengths
-  // are hand-computed and pinned as u64 constants so the M1 body can
-  // pass them to print_str without a runtime strlen.
+  // -- M2 output message pieces ----------------------------------------
+  // The M1-003 four-part shape is preserved: (optional verbose prefix)
+  // + (optional dry-run prefix) + <target> + trailing suffix. The
+  // trailing suffix at M2 names the M2 stub scope so a user reading
+  // stdout under an M2 build sees where the real work is scheduled.
 
   // "rm: " — printed when RmFlags::flag_v == 1, before any other
   // prefix. Four bytes: 'r' 'm' ':' ' '.
@@ -81,31 +89,28 @@ module RmRemove = structure {
   pub let DRY_RUN_PREFIX     : [u8; 14]  = "would remove: "
   pub let DRY_RUN_PREFIX_LEN : u64       = 14
 
-  // "\n" — the trailing byte when flag_dry_run is set. The
-  // dry-run output line is "[rm: ]would remove: <target>\n".
+  // "\n" — the trailing byte when flag_dry_run is set.
   pub let NEWLINE            : [u8; 1]   = "\n"
   pub let NEWLINE_LEN        : u64       = 1
 
-  // The M1-stub suffix. Emitted when flag_dry_run is NOT set. The
-  // default output line is "[rm: ]<target>: (M1 stub -- real trash-
-  // move via TXN lands at M2)\n" (51 bytes).
-  pub let M1_STUB_SUFFIX     : [u8; 51]  =
-    ": (M1 stub -- real trash-move via TXN lands at M2)\n"
-  pub let M1_STUB_SUFFIX_LEN : u64       = 51
+  // M2-scope stub suffix. Emitted from rm_process_one when
+  // flag_dry_run == 0 (the default). Names the M2 substrate gap so a
+  // user reading stdout sees exactly which kernel op is still missing.
+  pub let M2_STUB_SUFFIX     : [u8; 61]  =
+    ": (M2 stub -- real trash-move lands with PdxFS mutating ops)\n"
+  pub let M2_STUB_SUFFIX_LEN : u64       = 61
 
   // ============================================================================
   // remove_reset()
   //
   // Signature: remove_reset : () -> () !{mem} @{}
   //
-  // Unchanged from M1-002. Clears removed_count. See the M1-002
-  // preamble comment (preserved on the module doc block above) for
-  // the M2 role of the slot.
+  // Unchanged from M1-002. Clears removed_count. Leaf; r11 scratch.
   // ============================================================================
   pub let remove_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "rm.M1-003 remove_reset (unchanged from M1-002). Zero removed_count so rm_remove_body starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant.",
+      justification: "rm.M2-001 remove_reset (unchanged from M1-003). Zero removed_count so a fresh rm_remove_body run starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant.",
       block: {
         xor rax, rax;
         lea r11, [rip + removed_count];
@@ -118,32 +123,130 @@ module RmRemove = structure {
   // rm_remove_body(target_ptr) -> exit_code
   //
   // Signature: rm_remove_body : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): target_ptr — the M1-era first-positional pointer,
+  //              retained for signature compatibility with RmMain::
+  //              rm_main. At M2 this argument is IGNORED; the body
+  //              iterates ParsedArgs::pos_ptrs[0..pos_count] directly
+  //              so every positional is dispatched.
+  // RAX (output): 0 (EXIT_OK) — M2-001 always succeeds. Substrate-
+  //               real error codes (EXIT_OP_FAIL) become reachable
+  //               when the PdxFS mutating ops land.
+  //
+  // Iteration: for i in 0..pos_count:
+  //   target = pos_ptrs[i]
+  //   if flag_r == 1: walk_recursive(target)
+  //   else:           rm_process_one(target)
+  //
+  // Register plan (2-push + 8-byte pad):
+  //   r12 = i           (loop counter; preserved across dispatch call)
+  //   r13 = pos_count   (loaded once at loop entry; preserved)
+  //   [rsp+0] = pad     (keeps rsp%16 == 0 at every nested call site)
+  //   rdi = dispatch arg (pos_ptrs[i] before every call)
+  //   rax = flag load / call return scratch
+  //   r11 = lea scratch (all .bss reads via lea r11, [rip + sym])
+  //
+  // Prologue arithmetic (entry rsp % 16 == 8):
+  //   push r12    → rsp%16: 8 → 0
+  //   push r13    → rsp%16: 0 → 8
+  //   sub rsp, 8  → rsp%16: 8 → 0   ← every nested call site aligned
+  // Matched epilogue reverses.
+  // ============================================================================
+  pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.M2-001 rm_remove_body. Iterates ParsedArgs::pos_ptrs[0..pos_count] and dispatches per-target on flag_r. The M1-era rdi=target_ptr argument is ignored (RmMain::rm_main still passes pos_ptrs[0] out of signature-compat with M1; the M2 body reads pos_ptrs itself so every positional beyond the first is also processed). 2-push prologue (r12=i, r13=pos_count) + sub rsp, 8 pad keeps rsp%16 == 0 at every nested call site (dispatch to rm_process_one or RmWalk::walk_recursive). r12 + r13 preserved across each dispatch by the SysV callee-save contract; both callees respect it (rm_process_one uses only rbx; walk_recursive uses only rbx). All immediates in cmp are 0 or the pos_count bound (32, fits imm32 trivially). Every .bss read via lea r11, [rip + sym]. Return: pop pad, pop r13, pop r12, xor rax,rax, ret — exit code always EXIT_OK at M2-001 because the mutating substrate is not in-tree.",
+      block: {
+        // Prologue: preserve iteration state; align stack for nested calls.
+        push r12;                              // rsp%16: 8 → 0
+        push r13;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // Initialise loop counter and bound.
+        xor r12, r12;                          // i = 0
+        lea r11, [rip + ParsedArgs::pos_count];
+        mov r13, [r11];                        // r13 = pos_count
+
+      rm_remove_loop_head:
+        // Terminate when i >= pos_count.
+        cmp r12, r13;
+        jge rm_remove_loop_done;
+
+        // Load pos_ptrs[i] into rdi (dispatch arg).
+        lea r11, [rip + ParsedArgs::pos_ptrs];
+        mov rdi, [r11 + r12*8];
+
+        // Dispatch on flag_r. flag_r == 1 → recursive walk.
+        lea r11, [rip + RmFlags::flag_r];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_remove_call_process_one;
+
+        // Recursive branch. RmWalk::walk_recursive(target) → rax=0 at M2.
+        call RmWalk::walk_recursive;
+        jmp rm_remove_loop_advance;
+
+      rm_remove_call_process_one:
+        // Non-recursive branch. rm_process_one(target) → rax=0 at M2.
+        call rm_process_one;
+
+      rm_remove_loop_advance:
+        add r12, 1;
+        jmp rm_remove_loop_head;
+
+      rm_remove_loop_done:
+        // Epilogue: restore stack, return EXIT_OK.
+        add rsp, 8;                            // undo pad
+        pop r13;
+        pop r12;
+        xor rax, rax;                          // EXIT_OK
+        ret
+      }
+    }
+
+  // ============================================================================
+  // rm_process_one(target_ptr) -> exit_code
+  //
+  // Signature: rm_process_one : (u64) -> u64 !{mem, sysreg} @{}
   // RDI (input): target_ptr — VA of a NUL-terminated path (from
-  //                            ParsedArgs::pos_ptrs[0])
-  // RAX (output): 0 (EXIT_OK) — M1-003 always succeeds
+  //                            ParsedArgs::pos_ptrs[i])
+  // RAX (output): 0 (EXIT_OK) — M2 body always succeeds against the
+  //               stub substrate.
   //
-  // M1-003 body: honour flag_v + flag_dry_run + print the placeholder
-  // line, then return EXIT_OK. See the module preamble for the
-  // four-part output-line shape.
+  // Body: honour flag_v + flag_dry_run + print the four-part
+  // placeholder line, then bump removed_count and return EXIT_OK.
   //
-  // Register plan (1-push prologue for target-preservation + rsp align):
+  // Register plan (1-push prologue for target preservation + align):
   //   rbx = target_ptr  (preserved across every nested Print call)
-  //   rdx = NUL-walk cursor (in the target-length compute)
+  //   rdx = NUL-walk cursor for target-length compute
   //   rax = byte-load / flag-load / syscall-return scratch
   //   rdi = print_str arg 1 (buffer pointer)
   //   rsi = print_str arg 2 (length)
   //   r11 = lea scratch (for .rodata strings and RmFlags .bss)
   //
-  // Prologue: push rbx (rsp%16: 8 → 0). Epilogue: pop rbx, load
-  // rax = 0, ret (restores rsp%16 to 8 for the caller).
+  // Prologue: push rbx (rsp%16: 8 → 0). Epilogue: pop rbx, load rax=0,
+  // ret (restores rsp%16 to 8 for the caller). Same shape as the
+  // M1-003 body — the M2 restructure moved the iteration one level
+  // up to rm_remove_body, but the per-target body itself is
+  // structurally identical.
+  //
+  // M2-002/003/004 body edits (arriving in the sibling commits):
+  //   M2-002 adds a flag_f branch that emits a "would confirm" note
+  //          when flag_f == 0 (prompt is not yet interactive, so the
+  //          note is stdout-only; -f causes it to be skipped).
+  //   M2-003 threads a RmRetention::retention_emit_note call between
+  //          the target-print and the M2-stub suffix so the trash
+  //          entry's 24h retention deadline is surfaced per-target.
+  //   M2-004 dispatches on flag_wipe: when set, RmWipe::wipe_emit +
+  //          wipe_mark replace the retention emit + M2-stub suffix
+  //          (a shred does not create a trash-subtree entry, so no
+  //          retention applies; the audit flag is set for M3-002).
   // ============================================================================
-  pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
+  pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M1-003 rm_remove_body first-runnable body. Reads flag_v + flag_dry_run from the RmFlags .bss slots, walks the target string to compute its length, emits the four-part placeholder line via Print::print_str: (optional 'rm: ') + (optional 'would remove: ' | default '') + <target> + ('\\n' | M1_STUB_SUFFIX). No filesystem side effects; the R48-close substrate is query-only on KIND_PDXFS_FILE and KIND_PDXFS_TXN (see design/architecture.md §6 for the substrate note). 1-push prologue (rbx) preserves target_ptr across up-to-four nested syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access is via lea r11, [rip + sym]. Return: pop rbx, xor rax,rax, ret — the exit code is always 0 at M1-003.",
+      justification: "rm.M2-001 rm_process_one. The M1-003 single-target body, extracted from the M1 rm_remove_body so the M2 iteration can dispatch to it per positional. Reads flag_v + flag_dry_run from the RmFlags .bss slots, walks the target string to compute its length, emits the four-part placeholder line via Print::print_str: (optional 'rm: ') + (optional 'would remove: ' | default '') + <target> + ('\\n' | M2_STUB_SUFFIX). No filesystem side effects; the mutating PdxFS substrate is not in-tree at HEAD (see the mv.M1-003 preamble in mv/src/rename.pdx for the same substrate gap). 1-push prologue (rbx) preserves target_ptr across up to four nested Print::print_str syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access is via lea r11, [rip + sym]. Bumps removed_count so the smoke matrix can count how many positionals reached the non-recursive branch. Return: pop rbx, xor rax,rax, ret — exit code always 0 at M2-001.",
       block: {
-        // Prologue: preserve target_ptr across the four possible
-        // Print::print_str calls.
+        // Prologue: preserve target_ptr across the four Print calls.
         push rbx;                              // rsp%16: 8 → 0
         mov rbx, rdi;                          // rbx = target_ptr
 
@@ -151,63 +254,67 @@ module RmRemove = structure {
         lea r11, [rip + RmFlags::flag_v];
         mov rax, [r11];
         cmp rax, 0;
-        je rm_remove_skip_verbose;
+        je rm_process_skip_verbose;
 
         lea rdi, [rip + VERBOSE_PREFIX];
         mov rsi, 4;                            // VERBOSE_PREFIX_LEN
         call Print::print_str;
 
-      rm_remove_skip_verbose:
+      rm_process_skip_verbose:
         // ---- Part 2: conditional "would remove: " (flag_dry_run == 1) ---
         lea r11, [rip + RmFlags::flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
-        je rm_remove_skip_dry_prefix;
+        je rm_process_skip_dry_prefix;
 
         lea rdi, [rip + DRY_RUN_PREFIX];
         mov rsi, 14;                           // DRY_RUN_PREFIX_LEN
         call Print::print_str;
 
-      rm_remove_skip_dry_prefix:
+      rm_process_skip_dry_prefix:
         // ---- Part 3: print the target string ----------------------------
-        // Walk from rbx to the first NUL to compute the target length.
-        // rdx = walk cursor; length = rdx - rbx after the walk.
         mov rdx, rbx;
 
-      rm_remove_walk_target:
+      rm_process_walk_target:
         xor rax, rax;
         mov_b rax, [rdx];
         cmp rax, 0;
-        je rm_remove_walk_done;
+        je rm_process_walk_done;
         add rdx, 1;
-        jmp rm_remove_walk_target;
+        jmp rm_process_walk_target;
 
-      rm_remove_walk_done:
+      rm_process_walk_done:
         // Print the target: rdi = rbx (buffer), rsi = rdx - rbx (length).
         mov rdi, rbx;
         mov rsi, rdx;
         sub rsi, rbx;
         call Print::print_str;
 
-        // ---- Part 4: trailing suffix (dry-run → '\n'; else → M1 stub) ---
+        // ---- Part 4: trailing suffix (dry-run → '\n'; else → M2 stub) ---
         lea r11, [rip + RmFlags::flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
-        je rm_remove_print_m1_suffix;
+        je rm_process_print_m2_suffix;
 
         // Dry-run: just a newline.
         lea rdi, [rip + NEWLINE];
         mov rsi, 1;                            // NEWLINE_LEN
         call Print::print_str;
-        jmp rm_remove_done_ok;
+        jmp rm_process_done_ok;
 
-      rm_remove_print_m1_suffix:
-        lea rdi, [rip + M1_STUB_SUFFIX];
-        mov rsi, 51;                           // M1_STUB_SUFFIX_LEN
+      rm_process_print_m2_suffix:
+        lea rdi, [rip + M2_STUB_SUFFIX];
+        mov rsi, 61;                           // M2_STUB_SUFFIX_LEN
         call Print::print_str;
         // fallthrough
 
-      rm_remove_done_ok:
+      rm_process_done_ok:
+        // Bump per-target counter; M4 smoke reads this back.
+        lea r11, [rip + removed_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
         // Epilogue: restore rbx, load exit code 0.
         pop rbx;
         xor rax, rax;                          // EXIT_OK
