@@ -74,7 +74,7 @@
 //     up-to-four nested Print::print_str calls. Entry rsp % 16 == 8;
 //     push brings it to 0 which satisfies syscall alignment.
 
-module RmWipe = structure {
+module Wipe = structure {
 
   // -- .bss slots -------------------------------------------------------
   //
@@ -152,20 +152,20 @@ module RmWipe = structure {
         mov [r11], rax;
 
         // (3) optional "rm: " prefix.
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je wipe_skip_verbose;
 
         lea rdi, [rip + VERBOSE_PREFIX];
         mov rsi, 4;                            // VERBOSE_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
       wipe_skip_verbose:
         // (4) "shred: " prefix (always).
         lea rdi, [rip + WIPE_PREFIX];
         mov rsi, 7;                            // WIPE_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
         // (5) walk target for length, print bytes.
         mov rdx, rbx;
@@ -182,16 +182,16 @@ module RmWipe = structure {
         mov rdi, rbx;
         mov rsi, rdx;
         sub rsi, rbx;
-        call Print::print_str;
+        call print_str;
 
         // (6) WIPE_STUB_SUFFIX.
         lea rdi, [rip + WIPE_STUB_SUFFIX];
         mov rsi, 67;                           // WIPE_STUB_SUFFIX_LEN
-        call Print::print_str;
+        call print_str;
 
         // Epilogue.
         pop rbx;
-        ret
+        ret;
       }
     }
 }

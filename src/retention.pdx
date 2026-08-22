@@ -51,7 +51,7 @@
 //     callee-save touched). Entry rsp % 16 == 8, post-sub rsp % 16 ==
 //     0 for the nested Print::print_str.
 
-module RmRetention = structure {
+module Retention = structure {
 
   // -- 24h in nanoseconds, absolute (needs r11 imm64 staging) -----------
   //
@@ -136,19 +136,19 @@ module RmRetention = structure {
         mov [r11], rax;
 
         // (3) optional verbose emit.
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je retention_done;
 
         lea rdi, [rip + RETENTION_NOTE];
         mov rsi, 31;                           // RETENTION_NOTE_LEN
-        call Print::print_str;
+        call print_str;
         // fallthrough
 
       retention_done:
         add rsp, 8;
-        ret
+        ret;
       }
     }
 }

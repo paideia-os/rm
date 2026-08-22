@@ -75,7 +75,7 @@
 //     == 8, post-sub rsp % 16 == 0 for every nested call site
 //     (remove_reset, flags_reset, rm_process_one, print_str).
 
-module M4Test004 = structure {
+module M4WipeForensic = structure {
 
   // -- Target string used by the synthetic invocation ------------------
   pub let TEST_TARGET : [u8; 12] = "test_target\0"
@@ -129,52 +129,52 @@ module M4Test004 = structure {
         sub rsp, 8;                              // rsp%16: 8 -> 0
 
         // (1) Reset rm state.
-        call RmRemove::remove_reset;
-        call RmFlags::flags_reset;
+        call remove_reset;
+        call flags_reset;
 
         // (2) Zero RmRetention slots (reset-list gap).
         xor rax, rax;
-        lea r11, [rip + RmRetention::retention_attach_count];
+        lea r11, [rip + retention_attach_count];
         mov [r11], rax;
-        lea r11, [rip + RmRetention::retention_deadline_ns];
+        lea r11, [rip + retention_deadline_ns];
         mov [r11], rax;
 
         // (3) Set flag_wipe = 1.
         mov rax, 1;
-        lea r11, [rip + RmFlags::flag_wipe];
+        lea r11, [rip + flag_wipe];
         mov [r11], rax;
 
         // (4) Invoke rm_process_one; dispatches into wipe branch.
         lea rdi, [rip + TEST_TARGET];
-        call RmRemove::rm_process_one;
+        call rm_process_one;
 
         // (5) Assertions.
         //     was_wiped_flag == 1
-        lea r11, [rip + RmWipe::was_wiped_flag];
+        lea r11, [rip + was_wiped_flag];
         mov rax, [r11];
         cmp rax, 1;
         jne m4_004_fail;
 
         //     wipe_count == 1
-        lea r11, [rip + RmWipe::wipe_count];
+        lea r11, [rip + wipe_count];
         mov rax, [r11];
         cmp rax, 1;
         jne m4_004_fail;
 
         //     undo_write_count == 0 (undo path skipped in wipe branch)
-        lea r11, [rip + RmUndo::undo_write_count];
+        lea r11, [rip + undo_write_count];
         mov rax, [r11];
         cmp rax, 0;
         jne m4_004_fail;
 
         //     retention_attach_count == 0 (retention skipped in wipe branch)
-        lea r11, [rip + RmRetention::retention_attach_count];
+        lea r11, [rip + retention_attach_count];
         mov rax, [r11];
         cmp rax, 0;
         jne m4_004_fail;
 
         //     removed_count == 1 (invocation completed)
-        lea r11, [rip + RmRemove::removed_count];
+        lea r11, [rip + removed_count];
         mov rax, [r11];
         cmp rax, 1;
         jne m4_004_fail;
@@ -182,18 +182,18 @@ module M4Test004 = structure {
         // (6) OK path.
         lea rdi, [rip + OK_MSG];
         mov rsi, 15;                             // OK_MSG_LEN
-        call Print::print_str;
+        call print_str;
         add rsp, 8;
         xor rax, rax;                            // 0 = OK
-        ret
+        ret;
 
       m4_004_fail:
         lea rdi, [rip + FAIL_MSG];
         mov rsi, 17;                             // FAIL_MSG_LEN
-        call Print::print_str;
+        call print_str;
         add rsp, 8;
         mov rax, 1;                              // 1 = FAIL
-        ret
+        ret;
       }
     }
 }

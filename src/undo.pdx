@@ -74,7 +74,7 @@
 //     substrate transition adds a nested sys_pdxfs_undo_append call
 //     whose alignment is a body-edit concern.
 
-module RmUndo = structure {
+module Undo = structure {
 
   // -- Record layout constants ------------------------------------------
   //
@@ -127,7 +127,7 @@ module RmUndo = structure {
         lea r11, [rip + undo_write_count];      mov [r11], rax;
         lea r11, [rip + undo_write_bytes];      mov [r11], rax;
         lea r11, [rip + undo_last_deadline_ns]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -193,7 +193,7 @@ module RmUndo = structure {
         //     r11 gets reused as the RmRetention .bss base for the
         //     load; the composition writes above have already
         //     committed so the base-swap is safe.
-        lea r11, [rip + RmRetention::retention_deadline_ns];
+        lea r11, [rip + retention_deadline_ns];
         mov rax, [r11];
 
         lea r11, [rip + _undo_scratch];
@@ -218,7 +218,7 @@ module RmUndo = structure {
         // append syscall's rc).
         pop rbx;
         xor rax, rax;
-        ret
+        ret;
       }
     }
 }

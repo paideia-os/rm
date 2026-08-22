@@ -64,7 +64,7 @@
 //   - audit_record_target prologue: sub rsp, 8 pad; same shape.
 //   - audit_post prologue: sub rsp, 8 pad; same shape.
 
-module RmAudit = structure {
+module Audit = structure {
 
   // -- Static op-name string for AuditClient::audit_begin ---------------
   //
@@ -121,7 +121,7 @@ module RmAudit = structure {
         lea r11, [rip + audit_records_err];    mov [r11], rax;
         lea r11, [rip + audit_commit_ok];      mov [r11], rax;
         lea r11, [rip + audit_commit_err];     mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -160,7 +160,7 @@ module RmAudit = structure {
         // from the caller (SysV rdi=op_args_ptr on entry to audit_pre).
         mov rsi, rdi;                          // rsi = op_args_ptr (arg 2)
         lea rdi, [rip + OP_NAME];              // rdi = &OP_NAME  (arg 1)
-        call AuditClient::audit_begin;
+        call audit_begin;
 
         // Stash id + observability.
         lea r11, [rip + audit_id_slot];
@@ -174,7 +174,7 @@ module RmAudit = structure {
         lea r11, [rip + audit_begin_ok];
         mov [r11], rcx;
         add rsp, 8;
-        ret
+        ret;
 
       audit_pre_err:
         // id == 0: begin failed.
@@ -183,7 +183,7 @@ module RmAudit = structure {
         mov [r11], rcx;
         xor rax, rax;                          // return 0
         add rsp, 8;
-        ret
+        ret;
       }
     }
 
@@ -229,11 +229,11 @@ module RmAudit = structure {
         // Compose the three-arg call. Order matters: rdx from rdi's
         // original before we overwrite rdi with the audit_id.
         mov rdx, rdi;                          // rdx = target_ptr (arg 3)
-        lea rsi, [rip + RmSchema::SCHEMA_LABEL]; // rsi = &SCHEMA_LABEL (arg 2)
+        lea rsi, [rip + SCHEMA_LABEL]; // rsi = &SCHEMA_LABEL (arg 2)
         lea r11, [rip + audit_id_slot];
         mov rdi, [r11];                        // rdi = audit_id_slot (arg 1)
 
-        call AuditClient::audit_record_output;
+        call audit_record_output;
 
         // Observability: bump ok / err based on rc.
         cmp rax, 0;
@@ -244,7 +244,7 @@ module RmAudit = structure {
         add rcx, 1;
         mov [r11], rcx;
         add rsp, 8;
-        ret
+        ret;
 
       audit_rt_err:
         lea r11, [rip + audit_records_err];
@@ -252,7 +252,7 @@ module RmAudit = structure {
         add rcx, 1;
         mov [r11], rcx;
         add rsp, 8;
-        ret
+        ret;
       }
     }
 
@@ -291,7 +291,7 @@ module RmAudit = structure {
         lea r11, [rip + audit_id_slot];
         mov rdi, [r11];                        // rdi = audit_id (arg 1)
 
-        call AuditClient::audit_commit;
+        call audit_commit;
 
         cmp rax, 0;
         jne audit_post_err;
@@ -305,7 +305,7 @@ module RmAudit = structure {
         mov [r11], rcx;
         xor rax, rax;                          // return AUDIT_OK
         add rsp, 8;
-        ret
+        ret;
 
       audit_post_err:
         mov rcx, 1;
@@ -313,7 +313,7 @@ module RmAudit = structure {
         mov [r11], rcx;
         // rax carries the underlying err code — propagate verbatim.
         add rsp, 8;
-        ret
+        ret;
       }
     }
 }

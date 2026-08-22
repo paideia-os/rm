@@ -104,30 +104,30 @@ module M4Runner = structure {
         // (1) Prologue fingerprint.
         lea rdi, [rip + RUNNER_PROLOGUE];
         mov rsi, 15;                             // RUNNER_PROLOGUE_LEN
-        call Print::print_str;
+        call print_str;
 
         // (2) Run each test; OR return code into rbx.
-        call M4Test001::run_m4_001;
+        call run_m4_001;
         or rbx, rax;
 
-        call M4Test002::run_m4_002;
+        call run_m4_002;
         or rbx, rax;
 
-        call M4Test003::run_m4_003;
+        call run_m4_003;
         or rbx, rax;
 
-        call M4Test004::run_m4_004;
+        call run_m4_004;
         or rbx, rax;
 
         // (3) Epilogue fingerprint.
         lea rdi, [rip + RUNNER_EPILOGUE];
         mov rsi, 20;                             // RUNNER_EPILOGUE_LEN
-        call Print::print_str;
+        call print_str;
 
         // (4) Return accumulator.
         mov rax, rbx;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

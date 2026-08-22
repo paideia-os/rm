@@ -58,7 +58,7 @@
 //   - rm_process_one prologue: 1-push (rbx). Entry rsp % 16 == 8;
 //     push brings it to 0. Same shape as the M1-003 body.
 
-module RmRemove = structure {
+module Remove = structure {
 
   // -- Exit codes shared with RmMain -----------------------------------
   pub let EXIT_OK             : u64 = 0
@@ -186,31 +186,31 @@ module RmRemove = structure {
         lea r11, [rip + confirm_skips_by_f];        mov [r11], rax;
         lea r11, [rip + confirm_prompts_stub];      mov [r11], rax;
         lea r11, [rip + rm_blocked_by_elevate];     mov [r11], rax;
-        lea r11, [rip + RmWipe::was_wiped_flag];    mov [r11], rax;
-        lea r11, [rip + RmWipe::wipe_count];        mov [r11], rax;
+        lea r11, [rip + was_wiped_flag];    mov [r11], rax;
+        lea r11, [rip + wipe_count];        mov [r11], rax;
 
         // M5-001: close the reset-list gap flagged in M4-001 —
         // RmRetention (2 slots) + RmWalk (2 slots) had no module reset
         // and were not covered by the M3 umbrella. Adding them here
         // makes a re-entered rm process baseline in every slot the
         // M4 smoke reads.
-        lea r11, [rip + RmRetention::retention_attach_count];
+        lea r11, [rip + retention_attach_count];
         mov [r11], rax;
-        lea r11, [rip + RmRetention::retention_deadline_ns];
+        lea r11, [rip + retention_deadline_ns];
         mov [r11], rax;
-        lea r11, [rip + RmWalk::walk_invocations];
+        lea r11, [rip + walk_invocations];
         mov [r11], rax;
-        lea r11, [rip + RmWalk::walk_blocked_by_elevate];
+        lea r11, [rip + walk_blocked_by_elevate];
         mov [r11], rax;
 
         // Delegate to M3 module resets (M3-001/002/003/004).
-        call RmSchema::schema_reset;
-        call RmAudit::audit_reset;
-        call RmUndo::undo_reset;
-        call RmElevate::elevate_reset;
+        call schema_reset;
+        call audit_reset;
+        call undo_reset;
+        call elevate_reset;
 
         add rsp, 8;
-        ret
+        ret;
       }
     }
 
@@ -251,7 +251,7 @@ module RmRemove = structure {
         sub rsp, 8;                            // rsp%16: 8 → 0
 
         // Branch on flag_f.
-        lea r11, [rip + RmFlags::flag_f];
+        lea r11, [rip + flag_f];
         mov rax, [r11];
         cmp rax, 0;
         jne confirm_f_active;
@@ -263,14 +263,14 @@ module RmRemove = structure {
         mov [r11], rax;
 
         // Emit note only under -v.
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je confirm_done;
 
         lea rdi, [rip + PROMPT_STUB_NOTE];
         mov rsi, 40;                           // PROMPT_STUB_NOTE_LEN
-        call Print::print_str;
+        call print_str;
         jmp confirm_done;
 
       confirm_f_active:
@@ -280,19 +280,19 @@ module RmRemove = structure {
         add rax, 1;
         mov [r11], rax;
 
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je confirm_done;
 
         lea rdi, [rip + F_SKIP_NOTE];
         mov rsi, 26;                           // F_SKIP_NOTE_LEN
-        call Print::print_str;
+        call print_str;
         // fallthrough
 
       confirm_done:
         add rsp, 8;
-        ret
+        ret;
       }
     }
 
@@ -340,7 +340,7 @@ module RmRemove = structure {
 
         // Initialise loop counter and bound.
         xor r12, r12;                          // i = 0
-        lea r11, [rip + ParsedArgs::pos_count];
+        lea r11, [rip + pos_count];
         mov r13, [r11];                        // r13 = pos_count
 
       rm_remove_loop_head:
@@ -349,17 +349,17 @@ module RmRemove = structure {
         jge rm_remove_loop_done;
 
         // Load pos_ptrs[i] into rdi (dispatch arg).
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + r12*8];
 
         // Dispatch on flag_r. flag_r == 1 → recursive walk.
-        lea r11, [rip + RmFlags::flag_r];
+        lea r11, [rip + flag_r];
         mov rax, [r11];
         cmp rax, 0;
         je rm_remove_call_process_one;
 
         // Recursive branch. RmWalk::walk_recursive(target) → rax=0 at M2.
-        call RmWalk::walk_recursive;
+        call walk_recursive;
         jmp rm_remove_loop_advance;
 
       rm_remove_call_process_one:
@@ -376,7 +376,7 @@ module RmRemove = structure {
         pop r13;
         pop r12;
         xor rax, rax;                          // EXIT_OK
-        ret
+        ret;
       }
     }
 
@@ -453,7 +453,7 @@ module RmRemove = structure {
         // from the caller's perspective. Bump rm_blocked_by_elevate so
         // an operator inspecting the counter set can see the refusal.
         mov rdi, rbx;
-        call RmElevate::elevate_check_and_request;
+        call elevate_check_and_request;
         cmp rax, 0;                            // RE_PROCEED (0)
         jne rm_process_blocked;
 
@@ -463,65 +463,65 @@ module RmRemove = structure {
 
         // ---- M2-004: --wipe short-circuit -------------------------------
         // Priority: dry-run beats wipe beats default.
-        lea r11, [rip + RmFlags::flag_dry_run];
+        lea r11, [rip + flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         jne rm_process_part1;                  // dry-run beats wipe
 
-        lea r11, [rip + RmFlags::flag_wipe];
+        lea r11, [rip + flag_wipe];
         mov rax, [r11];
         cmp rax, 0;
         je rm_process_part1;                   // no wipe: default path
 
         // --wipe branch: shred emit, then M3 hooks.
         mov rdi, rbx;                          // arg = target_ptr
-        call RmWipe::wipe_emit;
+        call wipe_emit;
 
         // M3-001 record emit (wipe path).
         mov rdi, rbx;                          // target_ptr
         mov rsi, r12;                          // target_len
         xor rdx, rdx;                          // was_dir = 0 (M3 stub)
         xor rcx, rcx;                          // trash_handle = 0 (M3 stub)
-        call RmSchema::record_emit;
+        call record_emit;
 
         // M3-002 audit record (wipe path).
         mov rdi, rbx;
-        call RmAudit::audit_record_target;
+        call audit_record_target;
 
         jmp rm_process_done_ok;
 
       rm_process_part1:
         // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je rm_process_skip_verbose;
 
         lea rdi, [rip + VERBOSE_PREFIX];
         mov rsi, 4;                            // VERBOSE_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
       rm_process_skip_verbose:
         // ---- Part 2: conditional "would remove: " (flag_dry_run == 1) ---
-        lea r11, [rip + RmFlags::flag_dry_run];
+        lea r11, [rip + flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         je rm_process_skip_dry_prefix;
 
         lea rdi, [rip + DRY_RUN_PREFIX];
         mov rsi, 14;                           // DRY_RUN_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
       rm_process_skip_dry_prefix:
         // ---- Part 3: print the target string ----------------------------
         // r12 already holds target_len — no second walk needed.
         mov rdi, rbx;                          // buffer
         mov rsi, r12;                          // length
-        call Print::print_str;
+        call print_str;
 
         // ---- Part 4: trailing suffix (dry-run → '\n' with NO M3 hook;
         //              else → retention_attach + record_emit + M2 stub) -
-        lea r11, [rip + RmFlags::flag_dry_run];
+        lea r11, [rip + flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         je rm_process_print_m2_suffix;
@@ -530,14 +530,14 @@ module RmRemove = structure {
         // non-emitting; the M3 record set describes real removals only.
         lea rdi, [rip + NEWLINE];
         mov rsi, 1;                            // NEWLINE_LEN
-        call Print::print_str;
+        call print_str;
         jmp rm_process_done_ok;
 
       rm_process_print_m2_suffix:
         // ---- M2-003: retention attach (populates retention_deadline_ns
         //              which RmUndo::undo_write snapshots below) -------
         mov rdi, rbx;                          // arg = target_ptr
-        call RmRetention::retention_attach;
+        call retention_attach;
 
         // ---- M3-003: undo write (default path only — wipe leaves no
         //              trash entry so no undo record applies) ---------
@@ -545,23 +545,23 @@ module RmRemove = structure {
         mov rsi, r12;                          // target_len
         xor rdx, rdx;                          // was_dir = 0 (M3 stub)
         xor rcx, rcx;                          // trash_handle = 0 (M3 stub)
-        call RmUndo::undo_write;
+        call undo_write;
 
         // ---- M3-001: record emit (default path) --------------------------
         mov rdi, rbx;
         mov rsi, r12;
         xor rdx, rdx;
         xor rcx, rcx;
-        call RmSchema::record_emit;
+        call record_emit;
 
         // ---- M3-002: audit record (default path) -------------------------
         mov rdi, rbx;
-        call RmAudit::audit_record_target;
+        call audit_record_target;
 
         // ---- M2 stub suffix (visual: names the substrate gap) -----------
         lea rdi, [rip + M2_STUB_SUFFIX];
         mov rsi, 61;                           // M2_STUB_SUFFIX_LEN
-        call Print::print_str;
+        call print_str;
         // fallthrough
 
       rm_process_done_ok:
@@ -576,7 +576,7 @@ module RmRemove = structure {
         pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK
-        ret
+        ret;
 
       rm_process_blocked:
         // ---- Elevate refused: skip the removal entirely -----------------
@@ -591,7 +591,7 @@ module RmRemove = structure {
         pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK at M3
-        ret
+        ret;
       }
     }
 }

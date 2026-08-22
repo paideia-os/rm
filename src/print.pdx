@@ -80,7 +80,7 @@ module Print = structure {
         mov rdi, 1;                         // syscall arg 1 = FD_STDOUT
         mov rax, 1;                         // SYSCALL_WRITE
         syscall;
-        ret
+        ret;
       }
     }
 
@@ -106,7 +106,7 @@ module Print = structure {
         mov rdi, 2;                         // syscall arg 1 = FD_STDERR
         mov rax, 1;                         // SYSCALL_WRITE
         syscall;
-        ret
+        ret;
       }
     }
 }

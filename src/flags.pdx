@@ -39,7 +39,7 @@
 //     mitigation.
 //   - Leaf functions: no callee-save touched, no push/pop parity.
 
-module RmFlags = structure {
+module Flags = structure {
 
   // ============================================================================
   // Boolean flag slots. Each is u64-typed even though the value is
@@ -98,7 +98,7 @@ module RmFlags = structure {
         lea r11, [rip + flag_v];       mov [r11], rax;
         lea r11, [rip + flag_wipe];    mov [r11], rax;
         lea r11, [rip + flag_dry_run]; mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -134,14 +134,14 @@ module RmFlags = structure {
       justification: "rm.M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d' (distinct across the M1 vocabulary); per-branch inline byte-compare with #1248-mitigated byte loads. Unknown flags fall through silently at M1 (documented in design/argv-surface.md; enforcement lands at M4 as a body edit returning a u64 error code). All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
       block: {
         xor r8, r8;                              // i = 0
-        lea r11, [rip + ParsedArgs::flag_count];
+        lea r11, [rip + flag_count];
         mov r9, [r11];                           // r9 = flag_count
 
       flags_scan_loop_head:
         cmp r8, r9;
         jge flags_scan_done;
 
-        lea r11, [rip + ParsedArgs::flag_names];
+        lea r11, [rip + flag_names];
         mov rdx, [r11 + r8*8];                   // rdx = flag_names[i]
 
         // First-byte switch on the flag name.
@@ -222,7 +222,7 @@ module RmFlags = structure {
         jmp flags_scan_loop_head;
 
       flags_scan_done:
-        ret
+        ret;
       }
     }
 }

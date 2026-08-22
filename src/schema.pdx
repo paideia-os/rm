@@ -73,7 +73,7 @@
 //     entry rsp % 16 == 8, post-prologue rsp % 16 == 0 for the nested
 //     Send::send_record call.
 
-module RmSchema = structure {
+module Schema = structure {
 
   // -- Schema hash (32-byte BLAKE3-truncated placeholder) ---------------
   //
@@ -161,7 +161,7 @@ module RmSchema = structure {
         lea r11, [rip + schema_bind_attempts];   mov [r11], rax;
         lea r11, [rip + record_emit_count];      mov [r11], rax;
         lea r11, [rip + record_emit_err_count];  mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -201,7 +201,7 @@ module RmSchema = structure {
         mov rdi, 1;
         // Arg 2: schema_id = &SCHEMA_HASH.
         lea rsi, [rip + SCHEMA_HASH];
-        call Binding::libpdx_semantic_pipe_bind;
+        call libpdx_semantic_pipe_bind;
 
         // On SP_OK set schema_bind_ok = 1; on error propagate rax.
         cmp rax, 0;
@@ -214,7 +214,7 @@ module RmSchema = structure {
 
       schema_bind_out:
         add rsp, 8;
-        ret
+        ret;
       }
     }
 
@@ -277,7 +277,7 @@ module RmSchema = structure {
         mov rdi, 1;                            // STDOUT_FD
         mov rsi, r12;
         mov rdx, 40;                           // RECORD_BYTES
-        call Send::send_record;
+        call send_record;
 
         // (3) Observability: bump ok / err counter based on rc.
         cmp rax, 0;
@@ -300,7 +300,7 @@ module RmSchema = structure {
         add rsp, 8;
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

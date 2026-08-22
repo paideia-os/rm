@@ -60,7 +60,7 @@
 //     elevate_client_request call. Entry rsp % 16 == 8; push brings
 //     it to 0.
 
-module RmElevate = structure {
+module Elevate = structure {
 
   // -- /system/ prefix pattern -------------------------------------------
   //
@@ -135,7 +135,7 @@ module RmElevate = structure {
         lea r11, [rip + elevate_ok_count];      mov [r11], rax;
         lea r11, [rip + elevate_err_count];     mov [r11], rax;
         lea r11, [rip + elevate_last_ret];      mov [r11], rax;
-        ret
+        ret;
       }
     }
 
@@ -231,7 +231,7 @@ module RmElevate = structure {
         xor rsi, rsi;                          // dur = 0
         lea rdx, [rip + _elevate_req_buf];     // req_buf
         lea rcx, [rip + _elevate_reply_buf];   // reply_buf
-        call ElevateClient::elevate_client_request;
+        call elevate_client_request;
 
         // Snapshot return, classify.
         lea r11, [rip + elevate_last_ret];
@@ -253,7 +253,7 @@ module RmElevate = structure {
         mov [r11], rax;
         mov rax, 1;                            // RE_BLOCKED
         pop rbx;
-        ret
+        ret;
 
       re_ok:
         lea r11, [rip + elevate_ok_count];
@@ -262,13 +262,13 @@ module RmElevate = structure {
         mov [r11], rax;
         xor rax, rax;                          // RE_PROCEED
         pop rbx;
-        ret
+        ret;
 
       re_no_elevate:
         // No /system/ prefix — proceed without elevate.
         xor rax, rax;                          // RE_PROCEED
         pop rbx;
-        ret
+        ret;
       }
     }
 }

@@ -54,7 +54,7 @@
 //   RmRemove::rm_remove_body      (this repo)
 //   Print::print_err              (this repo)
 
-module RmMain = structure {
+module Main = structure {
 
   // -- Exit codes (public so tests / consumers can match on them) ------
   pub let EXIT_OK                 : u64 = 0
@@ -113,8 +113,8 @@ module RmMain = structure {
         // umbrella which zeroes every M3 module's observability slots
         // including audit_id_slot). Hoisted from the have_target branch
         // at M3-002 so audit_pre's audit_id_slot survives the reset.
-        call ParsedArgs::reset;
-        call RmRemove::remove_reset;
+        call reset;
+        call remove_reset;
 
         // Step 1b (M3-002): open the audit envelope. op_args=0 at M3
         // (audit-reader is permitted to render a record with no argv
@@ -122,12 +122,12 @@ module RmMain = structure {
         // semantics); observability lives in audit_begin_ok /
         // audit_begin_err.
         xor rdi, rdi;                          // op_args_ptr = 0
-        call RmAudit::audit_pre;
+        call audit_pre;
 
         // Step 2: parse. rdi = argv, rsi = argc (libpdx-argv ABI).
         mov rdi, rbx;
         mov rsi, r12;
-        call Parser::parse_argv;
+        call parse_argv;
 
         // Step 3: check parse error. rax == 0 (ERR_OK) → continue.
         cmp rax, 0;
@@ -136,23 +136,23 @@ module RmMain = structure {
         // Parse failed: print diagnostic on stderr, return EXIT_USAGE.
         lea rdi, [rip + PARSE_FAIL_MSG];
         mov rsi, 38;                           // PARSE_FAIL_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 2;                            // EXIT_USAGE
         jmp rm_main_epilogue;
 
       rm_main_parse_ok:
         // Step 4: reset + scan the flag slots.
-        call RmFlags::flags_reset;
-        call RmFlags::flags_scan;
+        call flags_reset;
+        call flags_scan;
 
         // Step 4b (M3-001): bind fd 1 to the RemoveRecord@0.1 schema.
         // Failure is non-fatal at M3 (see schema.pdx §Substrate-and-
         // broker note); observability lives in schema_bind_ok /
         // schema_bind_attempts.
-        call RmSchema::schema_bind_stdout;
+        call schema_bind_stdout;
 
         // Step 5: check pos_count. rax = ParsedArgs::pos_count.
-        lea r11, [rip + ParsedArgs::pos_count];
+        lea r11, [rip + pos_count];
         mov rax, [r11];
         cmp rax, 0;
         jne rm_main_have_target;
@@ -160,7 +160,7 @@ module RmMain = structure {
         // No positional supplied → print USAGE_MSG on stderr, return 2.
         lea rdi, [rip + USAGE_MSG];
         mov rsi, 46;                           // USAGE_MSG_LEN
-        call Print::print_err;
+        call print_err;
         mov rax, 2;                            // EXIT_USAGE
         jmp rm_main_epilogue;
 
@@ -168,9 +168,9 @@ module RmMain = structure {
         // Step 8: dispatch to rm_remove_body(target_ptr). remove_reset
         // was hoisted to the top of the body at M3-002.
         // target_ptr = ParsedArgs::pos_ptrs[0].
-        lea r11, [rip + ParsedArgs::pos_ptrs];
+        lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + 0];                    // pos_ptrs[0]
-        call RmRemove::rm_remove_body;
+        call rm_remove_body;
 
       rm_main_epilogue:
         // Step 9 (M3-002): commit the audit envelope. Preserve the exit
@@ -179,14 +179,14 @@ module RmMain = structure {
         // fanout).
         mov r12, rax;                          // r12 = exit_code
         mov rdi, rax;                          // arg1 = exit_code
-        call RmAudit::audit_post;
+        call audit_post;
         mov rax, r12;                          // restore exit_code
 
         // Restore stack, return with rax carrying the exit code.
         add rsp, 8;                            // undo pad
         pop r12;
         pop rbx;
-        ret
+        ret;
       }
     }
 }

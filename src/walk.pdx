@@ -72,7 +72,7 @@
 //     16 == 8; push brings it to 0 which satisfies the alignment
 //     invariant for the syscall-bearing print helper.
 
-module RmWalk = structure {
+module Walk = structure {
 
   // -- Walk-invocation counter -----------------------------------------
   // Bumped every time walk_recursive enters. Reset alongside
@@ -177,20 +177,20 @@ module RmWalk = structure {
         mov [r11], rax;
 
         // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
-        lea r11, [rip + RmFlags::flag_v];
+        lea r11, [rip + flag_v];
         mov rax, [r11];
         cmp rax, 0;
         je walk_skip_verbose;
 
         lea rdi, [rip + VERBOSE_PREFIX];
         mov rsi, 4;                            // VERBOSE_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
       walk_skip_verbose:
         // ---- Part 2: "recursive walk of: " prefix (always) --------------
         lea rdi, [rip + WALK_PREFIX];
         mov rsi, 19;                           // WALK_PREFIX_LEN
-        call Print::print_str;
+        call print_str;
 
         // ---- Part 3: print the target string ----------------------------
         mov rdx, rbx;
@@ -207,10 +207,10 @@ module RmWalk = structure {
         mov rdi, rbx;
         mov rsi, rdx;
         sub rsi, rbx;
-        call Print::print_str;
+        call print_str;
 
         // ---- Part 4: trailing suffix (dry-run → '\n'; else → WALK_STUB) -
-        lea r11, [rip + RmFlags::flag_dry_run];
+        lea r11, [rip + flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         je walk_print_stub;
@@ -218,20 +218,20 @@ module RmWalk = structure {
         // Dry-run: just a newline.
         lea rdi, [rip + NEWLINE];
         mov rsi, 1;                            // NEWLINE_LEN
-        call Print::print_str;
+        call print_str;
         jmp walk_done_ok;
 
       walk_print_stub:
         lea rdi, [rip + WALK_STUB_SUFFIX];
         mov rsi, 55;                           // WALK_STUB_SUFFIX_LEN
-        call Print::print_str;
+        call print_str;
         // fallthrough
 
       walk_done_ok:
         // Epilogue: restore rbx, load exit code 0.
         pop rbx;
         xor rax, rax;                          // EXIT_OK
-        ret
+        ret;
       }
     }
 }
