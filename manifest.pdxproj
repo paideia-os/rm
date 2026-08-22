@@ -1,0 +1,52 @@
+# rm — paideia-as build manifest
+#
+# Wave: R50  Milestone: M1 (design + skeleton)
+# Doc:   design/tooling/r49-r50-plan.md §5.8 in the paideia-os repo.
+#
+# Consumed by `paideia-as build`. Each line is a directive; blank lines
+# and lines starting with `#` are ignored. The M1 format mirrors
+# pkg/manifest.pdxproj — one target, one entry point, a source list,
+# a dep list, and the caps-manifest that ships in the packaged binary.
+# paideia-as v0.33+ is the required toolchain floor (mov_b narrow-load
+# mnemonic + @align attribute on .bss slots per the #1248 mitigation).
+#
+# The build produces one output file at build-out/rm (the elaborated
+# .pdx → ELF-like Paideia binary) plus a caps-manifest copy at
+# build-out/rm.caps for the InitCap sidecar packaging step at M5.
+
+name        = rm
+version     = 0.1.0-m1
+kind        = tool
+entry       = RmMain::rm_main
+output      = build-out/rm
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). -----------------
+sources:
+  - src/print.pdx                 # sys_write(fd=1/2) helpers
+  - src/flags.pdx                 # -r / -f / -v / --wipe / --dry-run scanner
+  - src/remove.pdx                # rm_remove body (M1: placeholder stub)
+  - src/main.pdx                  # rm_main(argc, argv) entry point
+
+# --- Library dependencies -----------------------------------------------
+# Only libpdx-argv at M1 (main uses it to parse flags + positionals).
+# libpdx-audit lands at M3-002; libpdx-elevate at M3-004; libpdx-
+# semantic-pipe at M3-001. libpdx-cap is not a direct dep at M1 — the
+# exec-time manifest verify against caps.decl is loader-side, not tool-
+# side, until libpdx-cap.M2 lands the CAP_MANIFEST_MISSING / EXTRA
+# logic (this matches the pkg / doc / shell M1 discipline).
+deps:
+  - libpdx-argv @ ^0.1
+
+# --- Paideia-as compliance flags ---------------------------------------
+# These mirror the invariants every R49/R50 tool observes and every M1
+# file in this repo is written against. Documented here so a build
+# under a non-conforming paideia-as revision refuses fast.
+compliance:
+  - module-basename-pascal        # Module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm ≤ 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call

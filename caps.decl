@@ -1,0 +1,68 @@
+# rm — caps.decl
+#
+# Wave: R50 (Wave 2)
+# Doc:  design/tooling/r49-r50-plan.md §5.8 in the paideia-os repo.
+#
+# rm removes files. Its full cap footprint through R50 is four
+# kinds; every one is declared here at M1 so downstream milestones
+# (M2 recursive walk, M3 audit + undo record + elevate wire-up) are
+# body edits inside existing bodies rather than caps.decl churn.
+#
+#   * KIND_USER (0x190, paideia-os src/kernel/core/cap/kind_user.pdx)
+#     — rm runs as a delegated user; every target-file open, every
+#     trash-subtree write, every undo-record write, and every
+#     RemoveRecord audit tail carries the invoker's KIND_USER cap-
+#     tail (D3 audit-first in design/tooling/plan.md).
+#
+#   * KIND_PDXFS_FILE (0x195, paideia-os src/kernel/core/cap/
+#     kind_pdxfs_file.pdx L82) narrowed to (write, <target-parent>).
+#     The scope is the parent directory of the target — the loader's
+#     InitCap sidecar (paideia-os src/kernel/core/loader/init_caps.
+#     pdx, R20b.M4-001) narrows the ambient KIND_PDXFS_FILE cap to
+#     the target's parent at exec so rm cannot touch a file outside
+#     the argv-supplied path. Cross-subtree targets and /system/
+#     targets require an elevate hop (M3-004); ambient write on the
+#     invoker's home subtree is what M1 declares.
+#
+#   * KIND_PDXFS_TXN (0x196, paideia-os src/kernel/core/cap/
+#     kind_pdxfs_txn.pdx L71) — the transaction cap. Every rm
+#     invocation opens exactly one TXN, moves the target into the
+#     trash subtree, and commits. Recursive rm (M2-001) reuses the
+#     same TXN for the leaf-first walk; the atomicity is a load-
+#     bearing invariant (I5 undo) and the reason a single TXN cap
+#     is declared at M1 rather than one per file.
+#
+#   * KIND_IPC_ENDPOINT (5, paideia-os src/kernel/core/cap/kind.pdx
+#     L72; R20b base kind) — the pipe substrate. Declared at M1 so
+#     M3's RemoveRecord[] emission (via libpdx-semantic-pipe) and
+#     the audit-broker send (via libpdx-audit) do not need a caps.
+#     decl edit; the exec-time cap_manifest_verify at libpdx-cap
+#     M2-001 already sees the endpoint kind in the declared set.
+#
+# The elevate channel (KIND_ELEVATE_CHANNEL = 0x191, R48.M7 at
+# paideia-os src/kernel/core/ipc/elevate_channel.pdx) is NOT declared
+# at M1. Elevate is a per-operation request lodged when the target
+# is under /system/ or crosses the invoker's subtree; M3-004 wires
+# libpdx-elevate at that point. Ambient elevate authority would
+# violate D4 (destructive ops require per-op consent).
+#
+# InitCap sidecar note. All four kinds above are seeded into rm's
+# cap_table at exec by the loader from the shell's InitCap sidecar
+# (paideia-os src/kernel/core/loader/init_caps.pdx). The shell
+# narrows the ambient KIND_PDXFS_FILE cap to the target-parent
+# scope before it hands the sidecar to sys_execve so ambient write
+# authority on /pdx/ never leaks into rm.
+
+requires:
+  - KIND_USER
+  - KIND_PDXFS_FILE(write, <target-parent>)
+  - KIND_PDXFS_TXN
+  - KIND_IPC_ENDPOINT
+
+# Declared output schemas — the semantic-pipe schemas rm emits on
+# its stdout. M1 emits none (the first-runnable body prints text
+# only). M3-001 introduces RemoveRecord[] via libpdx-semantic-pipe
+# with fields path, size, was_dir, trash_handle; the name is pre-
+# declared here at M1 so consumers can inspect the manifest early.
+declares_output_schemas:
+  - RemoveRecord@0.1
