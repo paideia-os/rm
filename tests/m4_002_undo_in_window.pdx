@@ -1,0 +1,196 @@
+// tests/m4_002_undo_in_window.pdx -- rm.M4-002
+// M4Test002 module: undo within retention window succeeds.
+//
+// Scope
+// -----
+// This module implements the M4-002 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M4-002 line): "undo within retention window
+// succeeds". The invariant under test is: when an rm removal produces
+// an undo record, the record carries the same retention deadline
+// RmRetention just staged, and a subsequent `undo rm <target>` while
+// the deadline has not passed resolves the record and replays the
+// reversal.
+//
+// Substrate proxy at M4 (test-shape without live undo-log replay)
+// ---------------------------------------------------------------
+// The PdxFS v1 undo-log substrate (sys_pdxfs_undo_append + its replay
+// counterpart) is not in-tree at HEAD -- RmUndo::undo_write composes
+// the 6-lane record into _undo_scratch and bumps observability, but
+// does not commit to a syscall (see undo.pdx §Substrate note). The
+// test therefore asserts the *composition* invariant that the undo
+// replay path depends on:
+//
+//   * RmRetention::retention_attach populates retention_deadline_ns
+//     with the 24h ns constant (RETENTION_24H_NS = 0x4E94914F0000)
+//     before RmUndo::undo_write reads it;
+//   * RmUndo::undo_write snapshots retention_deadline_ns into both
+//     lane [32] of _undo_scratch AND into undo_last_deadline_ns;
+//   * RmUndo::undo_write_count and undo_write_bytes advance by 1 and
+//     UNDO_RECORD_BYTES (48) respectively per invocation.
+//
+// A live undo replay at M5 substrate landing reads lane [32] and
+// compares against the current clock; if the deadline has not passed
+// the replay succeeds. This M4 test proves the composition side of
+// that comparison is well-formed.
+//
+// M4 test invariant asserted here
+// -------------------------------
+// After one retention_attach + undo_write pair on a synthetic
+// non-/system/ target:
+//
+//   RmRetention::retention_deadline_ns   == 0x4E94914F0000  (24h ns)
+//   RmUndo::undo_write_count             == 1
+//   RmUndo::undo_write_bytes             == 48              (UNDO_RECORD_BYTES)
+//   RmUndo::undo_last_deadline_ns        == 0x4E94914F0000  (snapshot matches)
+//
+// Any divergence prints the M4-002 FAIL fingerprint and returns 1.
+// A clean run prints the M4-002 OK fingerprint and returns 0.
+//
+// Ordering discipline verified
+// ----------------------------
+// retention_attach MUST run BEFORE undo_write -- undo_write reads
+// retention_deadline_ns at composition time (undo.pdx L196-203). The
+// test exercises the exact ordering RmRemove::rm_process_one uses
+// (retention_attach hoisted before undo_write in the default branch;
+// see remove.pdx §rm_process_print_m2_suffix).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module M4Test002 (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF EXCEPT the 24h ns literal
+//     (0x4E94914F0000) which exceeds imm32 and is staged in r10 via
+//     mov r10, imm64 before the compare (paideia-as r11 imm64 sweep
+//     pattern; r10 chosen because r11 holds the .bss lea base at
+//     that point). Matches the retention.pdx retention_attach
+//     staging discipline.
+//   - r11 is scratch (every .bss lea and .rodata lea).
+//   - No byte reads (all qword-wide composition checks).
+//   - run_m4_002 prologue: sub rsp, 8 pad = 8 bytes; entry rsp % 16
+//     == 8, post-sub rsp % 16 == 0 for every nested call site
+//     (remove_reset, retention_attach, undo_write, print_str).
+
+module M4Test002 = structure {
+
+  // -- Target string used by the synthetic invocation ------------------
+  // 12 bytes = "test_target\0". Length 11 (NUL excluded).
+  pub let TEST_TARGET     : [u8; 12] = "test_target\0"
+  pub let TEST_TARGET_LEN : u64      = 11
+
+  // -- Fingerprint lines emitted to stdout via Print::print_str --------
+  pub let OK_MSG     : [u8; 15] = "[rm.M4-002 OK]\n"
+  pub let OK_MSG_LEN : u64      = 15
+
+  pub let FAIL_MSG     : [u8; 17] = "[rm.M4-002 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 17
+
+  // ============================================================================
+  // run_m4_002() -> u64
+  //
+  // Signature: run_m4_002 : () -> u64 !{mem, sysreg} @{cap}
+  // RAX (output): 0 = OK, 1 = FAIL.
+  //
+  // Body:
+  //   (1) reset rm state (RmRemove::remove_reset zeros undo + schema +
+  //       audit + elevate slots + M2 counters).
+  //   (2) zero RmRetention slots (not covered by remove_reset).
+  //   (3) call RmRetention::retention_attach(target) -- stages the 24h
+  //       deadline into retention_deadline_ns.
+  //   (4) call RmUndo::undo_write(target, target_len, was_dir=0,
+  //       trash_handle=0) -- composes the 6-lane record + snapshots
+  //       retention_deadline_ns into lane [32] + undo_last_deadline_ns.
+  //   (5) assert retention_deadline_ns, undo_write_count,
+  //       undo_write_bytes, undo_last_deadline_ns all match expected.
+  //   (6) print OK or FAIL; return 0 or 1.
+  //
+  // Effect tail !{mem, sysreg} @{cap} covers the (sysreg) syscall
+  // fanout inside Print::print_str; retention_attach and undo_write
+  // themselves declare !{mem, sysreg} @{} and !{mem} @{} respectively.
+  //
+  // Register plan (leaf w.r.t. callee-saves; every nested call takes
+  // aligned rsp):
+  //   sub rsp, 8   -- align rsp%16 to 0 for every nested call
+  //   rax = counter/store scratch + call return
+  //   rdi = call arg 1 (target_ptr for retention/undo; buf for print)
+  //   rsi = call arg 2 (target_len for undo; len for print)
+  //   rdx = call arg 3 (was_dir for undo)
+  //   rcx = call arg 4 (trash_handle for undo)
+  //   r10 = imm64 stage for RETENTION_24H_NS compare (see compliance)
+  //   r11 = lea scratch (.bss slot reads)
+  // ============================================================================
+  pub let run_m4_002 : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M4-002 run_m4_002. Verifies the undo-record composition invariant that a live undo replay within the 24h retention window depends on. Reset rm state (RmRemove::remove_reset delegates to undo_reset which zeros undo_write_count, undo_write_bytes, undo_last_deadline_ns); zero the two RmRetention slots not covered by remove_reset (walk.pdx L99-105 reset-list gap). Call retention_attach (stages 0x4E94914F0000 into retention_deadline_ns per retention.pdx L133) then undo_write with target_len from TEST_TARGET_LEN (avoids an in-test NUL-walk; the composition path is what we're testing, not the length compute). Assert retention_deadline_ns == 0x4E94914F0000 (stages via mov r10, imm64 for the compare because 0x4E94914F0000 > imm32 window; r10 chosen because r11 holds the .bss lea base at that point). Assert undo_write_count == 1, undo_write_bytes == 48 (UNDO_RECORD_BYTES from undo.pdx L89), undo_last_deadline_ns == 0x4E94914F0000. Any divergence prints FAIL and returns 1. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for every nested call site. r11 scratch: sequential uses across the reset-slot writes and every counter/slot read; no overlap because each use writes before the next lea replaces r11. r10 used only for the imm64 stages of the 0x4E94914F0000 compares; caller-save so no restore needed. All other immediates 0, 1, or 48 (fit imm32). Effect tail !{mem, sysreg} @{cap} matches Print::print_str's callee tail; retention_attach and undo_write's tails are subsets.",
+      block: {
+        sub rsp, 8;                              // rsp%16: 8 -> 0
+
+        // (1) Reset rm state.
+        call RmRemove::remove_reset;
+
+        // (2) Zero RmRetention slots not covered by remove_reset.
+        xor rax, rax;
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov [r11], rax;
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov [r11], rax;
+
+        // (3) retention_attach stages RETENTION_24H_NS into
+        //     retention_deadline_ns.
+        lea rdi, [rip + TEST_TARGET];
+        call RmRetention::retention_attach;
+
+        // (4) undo_write composes the 6-lane record + snapshots the
+        //     retention deadline. was_dir = 0 (regular file);
+        //     trash_handle = 0 (M3 stub, no trash substrate).
+        lea rdi, [rip + TEST_TARGET];
+        mov rsi, 11;                             // TEST_TARGET_LEN
+        xor rdx, rdx;                            // was_dir = 0
+        xor rcx, rcx;                            // trash_handle = 0
+        call RmUndo::undo_write;
+
+        // (5) Assertions.
+        //     retention_deadline_ns == 0x4E94914F0000 (RETENTION_24H_NS)
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov rax, [r11];
+        mov r10, 0x4E94914F0000;                 // stage imm64
+        cmp rax, r10;
+        jne m4_002_fail;
+
+        //     undo_write_count == 1
+        lea r11, [rip + RmUndo::undo_write_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_002_fail;
+
+        //     undo_write_bytes == 48 (UNDO_RECORD_BYTES)
+        lea r11, [rip + RmUndo::undo_write_bytes];
+        mov rax, [r11];
+        cmp rax, 48;
+        jne m4_002_fail;
+
+        //     undo_last_deadline_ns == 0x4E94914F0000 (snapshot matches)
+        lea r11, [rip + RmUndo::undo_last_deadline_ns];
+        mov rax, [r11];
+        mov r10, 0x4E94914F0000;                 // stage imm64
+        cmp rax, r10;
+        jne m4_002_fail;
+
+        // (6) OK path.
+        lea rdi, [rip + OK_MSG];
+        mov rsi, 15;                             // OK_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        xor rax, rax;                            // 0 = OK
+        ret
+
+      m4_002_fail:
+        lea rdi, [rip + FAIL_MSG];
+        mov rsi, 17;                             // FAIL_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        mov rax, 1;                              // 1 = FAIL
+        ret
+      }
+    }
+}

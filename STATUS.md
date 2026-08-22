@@ -98,6 +98,16 @@ breakdown.
   Fingerprint: `[rm.M4-001 OK]` / `[rm.M4-001 FAIL]`. Also documents
   the reset-list gap in `RmRemove::remove_reset` (retention slots +
   walk slots not covered) and zeros them at test entry.
+- `tests/m4_002_undo_in_window.pdx` (issue #13, M4-002): undo within
+  retention window succeeds. Exercises the exact ordering discipline
+  from `rm_process_one` (retention_attach BEFORE undo_write) and
+  asserts the composition invariant a live undo replay depends on:
+  `retention_deadline_ns == 0x4E94914F0000` (24h ns constant),
+  `undo_write_count == 1`, `undo_write_bytes == 48`
+  (UNDO_RECORD_BYTES), `undo_last_deadline_ns == 0x4E94914F0000`
+  (snapshot matches). Uses r10 to stage the 24h imm64 for the compare
+  (paideia-as r11 imm64 sweep pattern; r10 free because r11 holds the
+  .bss lea base). Fingerprint: `[rm.M4-002 OK]` / `[rm.M4-002 FAIL]`.
 
 ## Milestone rollup
 
@@ -115,7 +125,7 @@ breakdown.
 | M3-003 (#10) | PdxFS v1 undo record (replay reconstructs from trash)              | LANDED |
 | M3-004 (#11) | libpdx-elevate for /system/ + cross-subtree targets                | LANDED |
 | M4-001 (#12) | TXN-abort mid-remove: no files removed                             | LANDED |
-| M4-002 (#13) | undo within retention window succeeds                              | TBD    |
+| M4-002 (#13) | undo within retention window succeeds                              | LANDED |
 | M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | TBD    |
 | M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | TBD    |
 
