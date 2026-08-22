@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M2-003 (extends M2-002)
+// src/remove.pdx — rm.M2-004 (extends M2-003)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -135,12 +135,14 @@ module RmRemove = structure {
   pub let remove_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "rm.M2-002 remove_reset. Zero removed_count and the M2-002 confirm counters (confirm_skips_by_f, confirm_prompts_stub) so a fresh rm_remove_body run starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant reused across all writes.",
+      justification: "rm.M2-004 remove_reset. Zero removed_count, the M2-002 confirm counters (confirm_skips_by_f, confirm_prompts_stub), and the M2-004 wipe slots (RmWipe::was_wiped_flag, RmWipe::wipe_count) so a fresh rm_remove_body run starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant reused across all writes.",
       block: {
         xor rax, rax;
-        lea r11, [rip + removed_count];         mov [r11], rax;
-        lea r11, [rip + confirm_skips_by_f];    mov [r11], rax;
-        lea r11, [rip + confirm_prompts_stub];  mov [r11], rax;
+        lea r11, [rip + removed_count];             mov [r11], rax;
+        lea r11, [rip + confirm_skips_by_f];        mov [r11], rax;
+        lea r11, [rip + confirm_prompts_stub];      mov [r11], rax;
+        lea r11, [rip + RmWipe::was_wiped_flag];    mov [r11], rax;
+        lea r11, [rip + RmWipe::wipe_count];        mov [r11], rax;
         ret
       }
     }
@@ -352,7 +354,7 @@ module RmRemove = structure {
   pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M2-002 rm_process_one (was M2-001 body, extended). The M1-003 single-target body plus a leading confirm_check call (M2-002 body edit). confirm_check honours -f: bumps confirm_skips_by_f when flag_f == 1, or confirm_prompts_stub otherwise, and emits a one-line stub note under -v. After the confirm branch: reads flag_v + flag_dry_run, walks the target for its length, emits the four-part placeholder line via Print::print_str: (optional 'rm: ') + (optional 'would remove: ' | default '') + <target> + ('\\n' | M2_STUB_SUFFIX). No filesystem side effects; the mutating PdxFS substrate is not in-tree at HEAD (see the mv.M1-003 preamble in mv/src/rename.pdx for the same substrate gap). 1-push prologue (rbx) preserves target_ptr across confirm_check + up to four Print::print_str syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access is via lea r11, [rip + sym]. Bumps removed_count so the smoke matrix can count how many positionals reached the non-recursive branch. Return: pop rbx, xor rax,rax, ret — exit code always 0 at M2 because the mutating substrate is not in-tree.",
+      justification: "rm.M2-004 rm_process_one (extended through M2-001/002/003/004). Flow: (M2-002) confirm_check bumps confirm_skips_by_f (flag_f=1) or confirm_prompts_stub (flag_f=0) and emits F_SKIP_NOTE / PROMPT_STUB_NOTE under -v. Then dispatch: (a) flag_dry_run==1 → fall through to default 'would remove: <target>\\n' path; (b) flag_dry_run==0 AND flag_wipe==1 → RmWipe::wipe_emit handles the full four-part shred emit, sets was_wiped_flag, bumps wipe_count, and short-circuits to done_ok; (c) otherwise → fall through to the default path (Part 1 verbose prefix + Part 2 dry-run prefix + Part 3 target + Part 4 RmRetention::retention_attach + M2_STUB_SUFFIX). Priority order (design/argv-surface.md §3.2): dry-run beats wipe beats default. No filesystem side effects at M2 (mutating PdxFS substrate not in-tree; see mv.M1-003 for the same discipline). 1-push prologue (rbx) preserves target_ptr across confirm_check + wipe_emit + retention_attach + up to four Print::print_str syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access via lea r11, [rip + sym]. Bumps removed_count (per rm_process_one call). Return: pop rbx, xor rax,rax, ret — exit code always 0 at M2.",
       block: {
         // Prologue: preserve target_ptr across confirm_check + Print calls.
         push rbx;                              // rsp%16: 8 → 0
@@ -365,6 +367,31 @@ module RmRemove = structure {
         mov rdi, rbx;                          // arg = target_ptr
         call confirm_check;
 
+        // ---- M2-004: --wipe short-circuit (skips retention + stub) ------
+        // Priority order (design/argv-surface.md §3.2):
+        //   1. --dry-run beats --wipe → dry-run takes the existing
+        //      "would remove: <target>\n" path with no real side effects.
+        //   2. --wipe (without --dry-run) → RmWipe::wipe_emit handles the
+        //      full shred line (verbose prefix + "shred: " + target +
+        //      WIPE_STUB_SUFFIX), sets was_wiped_flag = 1, bumps
+        //      wipe_count. Retention does not apply (no trash entry).
+        //   3. Otherwise → fall through to Part 1 (verbose) below.
+        lea r11, [rip + RmFlags::flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne rm_process_part1;                  // dry-run beats wipe
+
+        lea r11, [rip + RmFlags::flag_wipe];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_process_part1;                   // no wipe: default path
+
+        // --wipe branch: full emit + audit-flag set + counter bump.
+        mov rdi, rbx;                          // arg = target_ptr
+        call RmWipe::wipe_emit;
+        jmp rm_process_done_ok;                // skip retention + stub
+
+      rm_process_part1:
         // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
         lea r11, [rip + RmFlags::flag_v];
         mov rax, [r11];

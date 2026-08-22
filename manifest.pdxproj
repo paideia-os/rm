@@ -29,6 +29,7 @@ sources:
   - src/remove.pdx                # rm_remove body (M2: iterate + dispatch)
   - src/walk.pdx                  # RmWalk::walk_recursive (M2-001)
   - src/retention.pdx             # RmRetention::retention_attach (M2-003)
+  - src/wipe.pdx                  # RmWipe::wipe_emit (M2-004)
   - src/main.pdx                  # rm_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------

@@ -332,3 +332,43 @@ needed.
 M4-003 test invariant ("undo after retention window returns
 ENOENT-with-diagnostic, not silent") reads back `retention_
 deadline_ns` to verify the expected 24h window.
+
+### 8.4 M2-004 `--wipe` shred + audit flag (issue #7)
+
+`RmWipe::wipe_emit(target_ptr)` (new module `src/wipe.pdx`) is the
+--wipe short-circuit inside `rm_process_one`. When
+`flag_dry_run == 0 && flag_wipe == 1`, `rm_process_one` bypasses
+Parts 1–4 entirely and dispatches to `wipe_emit`. The helper:
+
+1. sets `RmWipe::was_wiped_flag = 1` (the M3-002 audit hook stamps
+   this onto the `RemoveRecord`'s `was_wiped` boolean field so a
+   forensic reader can distinguish intentional shred from a later
+   retention-window reap);
+2. bumps `RmWipe::wipe_count`;
+3. emits the four-part line: `(rm: )?shred: <target>: (M2 stub --
+   immediate trash-unlink + best-effort byte overwrite)\n`.
+
+Priority order (design/argv-surface.md §3.2):
+
+- `--dry-run` beats `--wipe`: dry-run always emits `would remove:
+  <target>\n` and takes no real-side-effect path. Even in dry-run
+  the `confirm_check` bump still records the intent.
+- `--wipe` (without `--dry-run`) beats the default retention path:
+  a shred creates no trash entry, so `retention_attach` is not
+  called and no `RETENTION_NOTE` is emitted.
+- Under `-r` at post-M2 substrate landing, the recursive walk
+  threads wipe per-leaf. At M2 the walk branch does not
+  short-circuit on wipe — the walk skeleton emits one line per
+  top-level target regardless — and the wipe-in-walk composition
+  lands with the substrate transition.
+
+`confirm_check` runs BEFORE the wipe dispatch: under `-f --wipe`,
+`confirm_skips_by_f` bumps; without `-f`, `confirm_prompts_stub`
+bumps (M3-004 will require an elevate hop for --wipe under any
+target, not just `/system/`).
+
+`RmRemove::remove_reset` now zeros `was_wiped_flag` and `wipe_count`
+alongside the earlier counters. The M4-004 test invariant ("--wipe
+audit flag correctness: forensic reader can detect intentional
+shred") reads back `was_wiped_flag` after a `--wipe` invocation and
+asserts it is 1.

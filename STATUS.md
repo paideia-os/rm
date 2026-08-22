@@ -1,7 +1,7 @@
 # rm — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — in progress
+**Current milestone:** M2 (core implementation) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
 breakdown.
@@ -38,6 +38,13 @@ breakdown.
   emits RETENTION_NOTE under -v. Called from `rm_process_one`
   non-dry-run path before the M2 stub suffix; skipped by dry-run and
   by the walk branch (per-leaf hook lands with the substrate move).
+- `src/wipe.pdx` + `src/remove.pdx` extend (issue #7, M2-004):
+  --wipe shred + audit flag. New `RmWipe::wipe_emit(target_ptr)`
+  sets `was_wiped_flag = 1` (M3-002 audit reads this), bumps
+  `wipe_count`, emits four-part shred line ((rm: )?shred: <target>
+  + WIPE_STUB_SUFFIX 67B). Short-circuits in `rm_process_one` when
+  `flag_wipe == 1 && flag_dry_run == 0` — skips both retention and
+  M2 stub suffix. `remove_reset` zeros both new slots.
 
 ## Milestone rollup
 
@@ -49,7 +56,7 @@ breakdown.
 | M2-001 (#4) | recursive -r leaf-first walk under single TXN (skeleton)           | LANDED |
 | M2-002 (#5) | -f force flag (skip per-file confirmation)                         | LANDED |
 | M2-003 (#6) | 24h retention deadline metadata on trash-subtree entry             | LANDED |
-| M2-004 (#7) | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | OPEN   |
+| M2-004 (#7) | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
