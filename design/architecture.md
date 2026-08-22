@@ -264,3 +264,36 @@ one line per top-level positional and terminates. The stack will
 land alongside the substrate ops as a bounded `.bss` array; the size
 bound (initial target: 4096 entries × 24 bytes = 96 KiB) is a §8.1
 addendum for the substrate-landing patch, not an M2 concern.
+
+### 8.2 M2-002 `-f` force flag (issue #5)
+
+`RmRemove::confirm_check(target_ptr)` is a new leaf that
+`rm_process_one` calls immediately after preserving `target_ptr` in
+rbx. It reads `RmFlags::flag_f` and bumps exactly one of two counters
+per call:
+
+- `flag_f == 1` → `confirm_skips_by_f` (the user granted the skip)
+- `flag_f == 0` → `confirm_prompts_stub` (the future prompt path)
+
+When `flag_v == 1` the branch additionally emits a one-line note via
+`Print::print_str` — `F_SKIP_NOTE` ("-f: skipping confirmation\n",
+26 bytes) or `PROMPT_STUB_NOTE` ("would prompt for confirmation (M2
+stub)\n", 40 bytes). Without -v the counters bump silently.
+
+M2 has no interactive prompt because rm has no stdin binding — that
+lands with the shell.M3 stdin-plumbing work. `confirm_check` at M2
+therefore always allows the caller to proceed; its signature is
+`(u64) -> ()` at M2 and becomes `(u64) -> u64` (0 = proceed, 1 =
+abort) at M3 when the real prompt lands. The M2 → M3 upgrade is a
+body edit inside `confirm_check` + one branch in `rm_process_one`;
+no other module needs touching.
+
+The recursive walk branch (M2-001 `RmWalk::walk_recursive`) does
+NOT call `confirm_check` — `-r`'s POSIX-canonical semantic is "one
+implicit confirm for the whole subtree, granted by the presence of
+`-r` itself". This is called out in `design/argv-surface.md` §3.1
+under the -r entry.
+
+`RmRemove::remove_reset` now zeros the two new counters alongside
+`removed_count`; the counter-only observability at M2 is what the
+M4 smoke matrix reads back.

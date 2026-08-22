@@ -26,6 +26,11 @@ breakdown.
   `RmRemove::rm_process_one` (the M1-003 single-target body). Skeleton
   returns `EXIT_OK`; the mutating PdxFS ops land at the R42 substrate
   patch.
+- `src/remove.pdx` extend (issue #5, M2-002): -f force flag. New leaf
+  `confirm_check(target_ptr)` bumps `confirm_skips_by_f` (flag_f == 1)
+  or `confirm_prompts_stub` (flag_f == 0) and emits F_SKIP_NOTE /
+  PROMPT_STUB_NOTE under -v. Called from `rm_process_one` before the
+  target-print. `remove_reset` zeros the new counters.
 
 ## Milestone rollup
 
@@ -35,7 +40,7 @@ breakdown.
 | M1-002 (#2) | argv surface via libpdx-argv (rm [-r|-f|-v|--wipe|--dry-run])      | LANDED |
 | M1-003 (#3) | first runnable: single-file remove via trash-subtree move          | LANDED |
 | M2-001 (#4) | recursive -r leaf-first walk under single TXN (skeleton)           | LANDED |
-| M2-002 (#5) | -f force flag (skip per-file confirmation)                         | OPEN   |
+| M2-002 (#5) | -f force flag (skip per-file confirmation)                         | LANDED |
 | M2-003 (#6) | 24h retention deadline metadata on trash-subtree entry             | OPEN   |
 | M2-004 (#7) | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | OPEN   |
 
