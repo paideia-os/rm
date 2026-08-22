@@ -1,0 +1,199 @@
+// tests/m4_004_wipe_forensic.pdx -- rm.M4-004
+// M4Test004 module: --wipe audit flag correctness (forensic reader
+// can detect intentional shred).
+//
+// Scope
+// -----
+// This module implements the M4-004 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M4-004 line): "--wipe audit flag correctness
+// (forensic reader can detect intentional shred)". The invariant
+// under test is: a forensic reader inspecting the audit trail MUST
+// be able to distinguish two operationally-identical outcomes --
+//
+//   (a) "user ran rm and the trash entry was later reaped" (default
+//       path: undo record present, was_wiped_flag == 0, retention
+//       deadline set); vs
+//   (b) "user ran rm --wipe (intentional unrecoverable shred)"
+//       (wipe path: NO undo record, was_wiped_flag == 1, NO
+//       retention deadline attached).
+//
+// The two forensic signals are:
+//
+//   1. `RmWipe::was_wiped_flag` == 1 (stamped onto the RemoveRecord's
+//      was_wiped boolean field by the M3-002 audit hook).
+//   2. Absence of an undo record for the target (undo.pdx §Interaction
+//      with --wipe: wipe_emit does not call undo_write; undo_write
+//      is called ONLY from the non-wipe path).
+//
+// Reading either signal in isolation is insufficient: was_wiped_flag
+// without the undo-absence check could be spoofed by a race between
+// wipe_emit and a stray undo append; undo-absence without the flag
+// could reflect a plain rm whose undo write failed. Both together
+// give the forensic reader a load-bearing decision.
+//
+// The rm_process_one dispatch enforces both invariants together:
+// the --wipe branch (remove.pdx §rm_process_one, wipe short-circuit
+// at L436-452) calls wipe_emit (sets flag + emits shred line) then
+// jumps directly to rm_process_done_ok bypassing the retention +
+// undo hops. This test exercises that dispatch and asserts every
+// forensic-signal invariant on the observability counters.
+//
+// Substrate note (no live wipe at M4)
+// -----------------------------------
+// wipe.pdx §M2 documents that the actual shred (sys_pdxfs_unlink for
+// the trash-entry + sys_pdxfs_secdisc for the byte overwrite) is
+// R42 substrate work not in-tree. wipe_emit at M2-M3 sets the
+// forensic flag and emits the four-part shred line but does not
+// actually free the storage. The M4 test is therefore about the
+// AUDIT-side invariants -- the flag and the undo-absence -- not the
+// storage-side outcome. The M5 substrate commit adds the storage
+// assertions (byte range on the underlying device is zeroed / secdisc
+// completed) as body edits inside this test.
+//
+// M4 test invariants asserted here
+// --------------------------------
+// After one rm_process_one call with flag_wipe = 1 and flag_dry_run =
+// 0 on a synthetic non-/system/ target (--wipe branch, not dry-run,
+// not elevate-blocked):
+//
+//   RmWipe::was_wiped_flag              == 1  (forensic-flag SET)
+//   RmWipe::wipe_count                  == 1  (wipe_emit called)
+//   RmUndo::undo_write_count            == 0  (undo path SKIPPED)
+//   RmRetention::retention_attach_count == 0  (retention SKIPPED)
+//   RmRemove::removed_count             == 1  (invocation completed)
+//
+// Any divergence prints M4-004 FAIL and returns 1.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module M4Test004 (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (only 0 and 1 appear).
+//   - r11 is scratch (every .bss lea).
+//   - No byte reads (all qword-wide counter checks).
+//   - run_m4_004 prologue: sub rsp, 8 pad = 8 bytes; entry rsp % 16
+//     == 8, post-sub rsp % 16 == 0 for every nested call site
+//     (remove_reset, flags_reset, rm_process_one, print_str).
+
+module M4Test004 = structure {
+
+  // -- Target string used by the synthetic invocation ------------------
+  pub let TEST_TARGET : [u8; 12] = "test_target\0"
+
+  // -- Fingerprint lines emitted to stdout via Print::print_str --------
+  pub let OK_MSG     : [u8; 15] = "[rm.M4-004 OK]\n"
+  pub let OK_MSG_LEN : u64      = 15
+
+  pub let FAIL_MSG     : [u8; 17] = "[rm.M4-004 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 17
+
+  // ============================================================================
+  // run_m4_004() -> u64
+  //
+  // Signature: run_m4_004 : () -> u64 !{mem, sysreg} @{cap, sched}
+  // RAX (output): 0 = OK, 1 = FAIL.
+  //
+  // Body:
+  //   (1) reset rm state (RmRemove::remove_reset zeros was_wiped_flag,
+  //       wipe_count, undo_write_count via undo_reset).
+  //   (2) zero RmRetention slots (reset-list gap).
+  //   (3) set RmFlags::flag_wipe = 1; ensure flag_dry_run = 0 (from
+  //       flags_reset default) and other flags 0.
+  //   (4) invoke rm_process_one on the synthetic target.
+  //   (5) assert forensic-signal invariants:
+  //         was_wiped_flag == 1
+  //         wipe_count == 1
+  //         undo_write_count == 0        (undo path skipped)
+  //         retention_attach_count == 0  (retention path skipped)
+  //         removed_count == 1
+  //   (6) print OK or FAIL; return 0 or 1.
+  //
+  // Effect tail !{mem, sysreg} @{cap, sched} covers the audit +
+  // schema + elevate fanout inside rm_process_one's wipe branch
+  // (wipe path calls record_emit + audit_record_target; those are
+  // in-tree hooks that fire even under --wipe per remove.pdx L437-451).
+  //
+  // Register plan (leaf w.r.t. callee-saves; every nested call at
+  // aligned rsp):
+  //   sub rsp, 8   -- align rsp%16 to 0 for every nested call
+  //   rax = counter/store scratch + call return
+  //   rdi = call arg 1 (target_ptr for rm_process_one; buf for print)
+  //   rsi = call arg 2 (len for print)
+  //   r11 = lea scratch (every .bss / .rodata access)
+  // ============================================================================
+  pub let run_m4_004 : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M4-004 run_m4_004. Verifies the two forensic-signal invariants a reader uses to distinguish '--wipe intentional shred' from 'default rm later reaped': was_wiped_flag == 1 (positive stamp on the RemoveRecord's was_wiped field via the M3-002 audit hook) AND undo_write_count == 0 (undo path skipped so no reversal record exists). Reads either signal in isolation would be insufficient (spoof-resistance requires both). Reset rm state (RmRemove::remove_reset zeros was_wiped_flag, wipe_count via its explicit lea+mov pair, and undo_write_count via the delegated undo_reset); zero RmRetention slots (reset-list gap per walk.pdx L99-105). Set flag_wipe = 1 (leave others 0 from flags_reset). Invoke rm_process_one which dispatches on flag_wipe at remove.pdx L432-435 into the wipe branch (wipe_emit + record_emit + audit_record_target, then jump to rm_process_done_ok bypassing retention + undo). Assert was_wiped_flag == 1, wipe_count == 1, undo_write_count == 0, retention_attach_count == 0, removed_count == 1. Any divergence prints FAIL and returns 1. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for every nested call site. r11 scratch: sequential uses across the reset-slot writes, the flag write, and every counter read; no overlap. All immediates 0 or 1. Effect tail !{mem, sysreg} @{cap, sched} matches rm_process_one's callee tail (audit + schema + elevate fanout).",
+      block: {
+        sub rsp, 8;                              // rsp%16: 8 -> 0
+
+        // (1) Reset rm state.
+        call RmRemove::remove_reset;
+        call RmFlags::flags_reset;
+
+        // (2) Zero RmRetention slots (reset-list gap).
+        xor rax, rax;
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov [r11], rax;
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov [r11], rax;
+
+        // (3) Set flag_wipe = 1.
+        mov rax, 1;
+        lea r11, [rip + RmFlags::flag_wipe];
+        mov [r11], rax;
+
+        // (4) Invoke rm_process_one; dispatches into wipe branch.
+        lea rdi, [rip + TEST_TARGET];
+        call RmRemove::rm_process_one;
+
+        // (5) Assertions.
+        //     was_wiped_flag == 1
+        lea r11, [rip + RmWipe::was_wiped_flag];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_004_fail;
+
+        //     wipe_count == 1
+        lea r11, [rip + RmWipe::wipe_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_004_fail;
+
+        //     undo_write_count == 0 (undo path skipped in wipe branch)
+        lea r11, [rip + RmUndo::undo_write_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_004_fail;
+
+        //     retention_attach_count == 0 (retention skipped in wipe branch)
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_004_fail;
+
+        //     removed_count == 1 (invocation completed)
+        lea r11, [rip + RmRemove::removed_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_004_fail;
+
+        // (6) OK path.
+        lea rdi, [rip + OK_MSG];
+        mov rsi, 15;                             // OK_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        xor rax, rax;                            // 0 = OK
+        ret
+
+      m4_004_fail:
+        lea rdi, [rip + FAIL_MSG];
+        mov rsi, 17;                             // FAIL_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        mov rax, 1;                              // 1 = FAIL
+        ret
+      }
+    }
+}

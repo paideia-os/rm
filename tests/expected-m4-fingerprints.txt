@@ -1,0 +1,24 @@
+# tests/expected-m4-fingerprints.txt
+#
+# Expected stdout corpus for rm.M4 -- consumed by the paideia-os smoke
+# driver (tools/run-smoke.sh, grep-substring in-order match, same
+# discipline as tools/hw-smoke-fingerprints.md §0). Each non-comment
+# line must appear somewhere in the runner's stdout, in the order
+# listed, when every M4-00X test passes.
+#
+# Runner: M4Runner::m4_run_all (tests/m4_runner.pdx). Not wired into
+# manifest.pdxproj at M4 -- see tests/README.md §Build note. The M5
+# substrate integration commit lands the rm-tests build target so
+# this corpus becomes runnable end-to-end.
+#
+# On failure the offending test emits `[rm.M4-XXX FAIL]` in place of
+# `[rm.M4-XXX OK]`; the [rm.M4-runner done] epilogue still appears
+# (the runner does NOT short-circuit on first failure, so the full
+# failure matrix is visible from one execution).
+
+[rm.M4-runner]
+[rm.M4-001 OK]
+[rm.M4-002 OK]
+[rm.M4-003 OK]
+[rm.M4-004 OK]
+[rm.M4-runner done]

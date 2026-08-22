@@ -372,3 +372,78 @@ alongside the earlier counters. The M4-004 test invariant ("--wipe
 audit flag correctness: forensic reader can detect intentional
 shred") reads back `was_wiped_flag` after a `--wipe` invocation and
 asserts it is 1.
+
+## 9. M4 test corpus
+
+M4 lands four `tests/m4_XXX_*.pdx` modules -- one per issue on the
+paideia-os plan doc §5.8 M4-00X line -- plus a `M4Runner` aggregator
+and an expected-fingerprint corpus the smoke driver matches on.
+
+### 9.1 What the tests exercise (given the substrate gap)
+
+The PdxFS v1 mutating ops (`sys_pdxfs_txn_open`, `sys_pdxfs_move`,
+`sys_pdxfs_txn_abort`, `sys_pdxfs_txn_commit`, `sys_pdxfs_readdir`)
+scheduled at R42-PREP-004 are not in-tree at HEAD (STATUS.md §Upstream
+substrate). The M2/M3 milestones therefore expose their invariants via
+observability counters (`.bss` slots) rather than filesystem outcomes;
+the M4 tests read those counters back and assert the deltas the live
+substrate would produce.
+
+Each test uses the closest structurally-equivalent path a live
+substrate would touch and asserts the exact same observability shape
+that path would leave:
+
+| M4 test | Substrate proxy at HEAD                                                                | What the M5 substrate patch adds                                              |
+|---------|----------------------------------------------------------------------------------------|-------------------------------------------------------------------------------|
+| M4-001  | `--dry-run` branch of `rm_process_one` (dry-run and TXN-abort both leave M3 counters 0)| Real `sys_pdxfs_txn_abort` mid-remove; verify `removed_count == 0` too       |
+| M4-002  | Composition assertion: undo record snapshots the retention deadline                    | Live undo-log append + within-window replay verify                            |
+| M4-003  | Composition precondition: `_undo_scratch[32]` is non-zero and matches                  | Clock fast-forward past deadline + replay returns ENOENT-with-diagnostic     |
+| M4-004  | `rm_process_one` --wipe dispatch: forensic flag + no undo record                       | Real `sys_pdxfs_secdisc` outcome: byte range on device is zeroed              |
+
+The M4 tests document each substrate proxy inline in the module
+header and name the specific body edit an M5 substrate patch will
+apply to promote the test from proxy to live.
+
+### 9.2 Runner + fingerprint corpus
+
+`M4Runner::m4_run_all` (in `tests/m4_runner.pdx`) invokes each
+`M4Test0XX::run_m4_00X` in issue order, ORs their return codes into
+an accumulator, and returns 0 iff every test passed. It brackets the
+run with `[rm.M4-runner]` and `[rm.M4-runner done]` markers so a
+smoke driver can bracket the capture window and detect a crash-in-
+progress (absent `[done]` line ⇒ at least one test crashed the
+runner). No first-failure short-circuit -- every test runs so a
+maintainer sees the full failure matrix from one execution.
+
+`tests/expected-m4-fingerprints.txt` lists the six substring lines
+the paideia-os smoke driver (`tools/run-smoke.sh`) matches on when
+every test passes. The corpus follows the same grep-substring
+in-order convention as `tools/hw-smoke-fingerprints.md` §0.
+
+### 9.3 Reset-list gap surfaced by the corpus
+
+`RmRemove::remove_reset` at M3 zeros the M1/M2 counters and delegates
+to the four M3 module resets (`RmSchema::schema_reset`,
+`RmAudit::audit_reset`, `RmUndo::undo_reset`,
+`RmElevate::elevate_reset`) but does NOT cover
+`RmRetention::retention_attach_count`,
+`RmRetention::retention_deadline_ns`, or the two `RmWalk` slots
+(`walk.pdx` L99-105 documents the gap). Every M4 test explicitly
+zeros the RmRetention slots it depends on before invoking any rm
+helper. The M5 substrate commit that lands per-entry walk hooks also
+expands `remove_reset` to cover the gap; the M4 tests keep their
+explicit resets even after the widening so they stay self-contained.
+
+### 9.4 Build integration
+
+The tests are source-only at M4 -- `manifest.pdxproj` continues to
+build the shipped `build-out/rm` binary from `src/*.pdx` alone.
+Adding `tests/*.pdx` to the shipped surface would change the tool's
+exported symbol set, which is a signature-level change out of scope
+for M4. The M5 substrate-integration commit lands a separate
+`rm-tests` build target that reuses every `src/*.pdx` module and
+adds the four test modules plus the runner, with
+`M4Runner::m4_run_all` as its entry symbol. Until then the tests are
+read for correctness against the M2/M3 body shapes; the smoke driver
+stubs live in the paideia-os smoke matrix at `tools/run-smoke.sh`
+and are wired at rm.M5.

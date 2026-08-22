@@ -1,7 +1,7 @@
 # rm — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke) — in progress
+**Current milestone:** M4 (tests + smoke) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
 breakdown.
@@ -85,7 +85,7 @@ breakdown.
   top-level target (walk-per-entry hook lands with the substrate
   transition).
 
-## M4 — tests + smoke (in progress)
+## M4 — tests + smoke (complete)
 
 - `tests/m4_001_txn_abort.pdx` (issue #12, M4-001): TXN-abort mid-
   remove: no files removed. Uses `--dry-run` as the substrate proxy
@@ -119,6 +119,25 @@ breakdown.
   would let the diagnostic name a wrong deadline. Uses reg-reg
   compares via r8 so no imm64 stage is needed for the 24h constant.
   Fingerprint: `[rm.M4-003 OK]` / `[rm.M4-003 FAIL]`.
+- `tests/m4_004_wipe_forensic.pdx` (issue #15, M4-004): --wipe audit
+  flag correctness (forensic reader can detect intentional shred).
+  Invokes rm_process_one on a --wipe target and asserts BOTH
+  forensic signals a reader uses to distinguish intentional shred
+  from later reap: `RmWipe::was_wiped_flag == 1` (positive stamp on
+  the RemoveRecord's was_wiped field) AND `RmUndo::undo_write_count
+  == 0` (no undo record exists to reverse). Also asserts
+  `retention_attach_count == 0` (wipe path skips retention) and
+  `removed_count == 1`. Fingerprint: `[rm.M4-004 OK]` /
+  `[rm.M4-004 FAIL]`.
+- `tests/m4_runner.pdx` + `tests/expected-m4-fingerprints.txt`: the
+  M4Runner aggregator dispatches all four tests in issue-number order
+  (no first-failure short-circuit -- the full matrix is visible from
+  one run), brackets the run with `[rm.M4-runner]` +
+  `[rm.M4-runner done]` markers, and returns 0 iff every test
+  returned 0. The fingerprint corpus lists the six lines the smoke
+  driver expects on stdout when every test passes; the M5 substrate
+  integration commit wires the runner as an entry symbol of an
+  `rm-tests` build target so the corpus becomes runnable end-to-end.
 
 ## Milestone rollup
 
@@ -138,7 +157,7 @@ breakdown.
 | M4-001 (#12) | TXN-abort mid-remove: no files removed                             | LANDED |
 | M4-002 (#13) | undo within retention window succeeds                              | LANDED |
 | M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | LANDED |
-| M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | TBD    |
+| M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
