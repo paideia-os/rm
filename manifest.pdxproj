@@ -15,7 +15,7 @@
 # build-out/rm.caps for the InitCap sidecar packaging step at M5.
 
 name        = rm
-version     = 0.2.0-m2
+version     = 0.3.0-m3
 kind        = tool
 entry       = RmMain::rm_main
 output      = build-out/rm
@@ -30,6 +30,7 @@ sources:
   - src/walk.pdx                  # RmWalk::walk_recursive (M2-001)
   - src/retention.pdx             # RmRetention::retention_attach (M2-003)
   - src/wipe.pdx                  # RmWipe::wipe_emit (M2-004)
+  - src/schema.pdx                # RmSchema: RemoveRecord@0.1 bind + emit (M3-001)
   - src/main.pdx                  # rm_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------
@@ -41,6 +42,7 @@ sources:
 # logic (this matches the pkg / doc / shell M1 discipline).
 deps:
   - libpdx-argv @ ^0.1
+  - libpdx-semantic-pipe @ ^0.2
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

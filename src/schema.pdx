@@ -1,0 +1,306 @@
+// src/schema.pdx -- rm.M3-001
+// RmSchema module: RemoveRecord semantic-pipe schema bind + per-target
+// record emit, using libpdx-semantic-pipe M2 (Binding + Send).
+//
+// Scope
+// -----
+// This module implements the M3-001 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M3-001 line): "RemoveRecord[] schema bind
+// (path, size, was_dir, trash_handle)". Every rm invocation binds
+// one schema against the tool's output endpoint at start-of-run and
+// emits one RemoveRecord per positional it processed. Downstream
+// consumers filter / sort / plot by schema field rather than by
+// column-slicing text (design/tooling/plan.md D2 semantic pipes).
+//
+// The RemoveRecord layout at v0.1 is four u64-typed fields plus one
+// pointer (five 8-byte slots, 40 bytes total):
+//
+//   [0..8]   target_ptr           -- VA of the NUL-terminated path
+//                                    (interior pointer into argv;
+//                                    the consumer must treat this as
+//                                    a snapshot pointer whose owner is
+//                                    the emitting process's argv buffer)
+//   [8..16]  target_len           -- byte length of the path (NUL not
+//                                    included; consumer uses this to
+//                                    bound the read)
+//   [16..24] size                 -- file byte-size at removal time.
+//                                    At M3 this is always 0 (no
+//                                    stat-of-inode syscall in-tree
+//                                    yet; the M3 → substrate transition
+//                                    lands the read alongside the
+//                                    mutating PdxFS ops)
+//   [24..32] was_dir              -- 0 for a regular file, 1 for a
+//                                    directory. At M3 always 0 (no
+//                                    stat-of-inode syscall in-tree)
+//   [32..40] trash_handle         -- opaque u64 handle into the trash
+//                                    subtree entry. At M3 always 0
+//                                    (no trash-subtree substrate)
+//
+// The four "always 0 at M3" fields are the shape the substrate landing
+// fills in; the wire format is frozen at v0.1 so consumers can start
+// building against the schema before the substrate lands.
+//
+// Substrate-and-broker note
+// -------------------------
+// The libpdx-semantic-pipe M2 send path issues sys_ipc_send (sysno 42)
+// against the bound fd. rm binds fd 1 (stdout) at start-of-run; the
+// paideia-os init chain seeds fd 1 as a UART fast-path (see paideia-os
+// src/kernel/core/syscall/dispatch.pdx L25) rather than as a live
+// KIND_IPC_ENDPOINT. Every RmSchema::record_emit call at HEAD therefore
+// hits the send path but the underlying syscall returns a non-OK code
+// (fd is not an endpoint cap). Rather than exit 3 on every rm
+// invocation (which would make the M4 smoke matrix unrunnable before
+// the shell.M3 pipe-plumbing lands), M3-001 treats emit failure as
+// observability: the record_emit_err_count slot bumps and the tool
+// proceeds. The M3 → substrate transition edits the failure path to
+// enforce D3 audit-first (exit 3 on emit refusal) alongside the shell
+// pipe-plumbing landing. Same "faithfully emit shape without inventing
+// outcome" discipline the M2 skeleton observes for PdxFS mutating ops.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmSchema (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0, the STDOUT_FD constant
+//     1, the RECORD_BYTES constant 40, and single-byte chars appear).
+//   - r11 is scratch (used for every lea and every .bss access).
+//   - Byte reads via xor rax, rax; mov_b rax, [ptr] (the target-length
+//     NUL-walk).
+//   - schema_bind_stdout prologue: sub rsp, 8 = 8 bytes; entry rsp %
+//     16 == 8, post-sub rsp % 16 == 0 for the nested
+//     Binding::libpdx_semantic_pipe_bind call.
+//   - record_emit prologue: 2-push (rbx, r12) + sub rsp, 8 = 24 bytes;
+//     entry rsp % 16 == 8, post-prologue rsp % 16 == 0 for the nested
+//     Send::send_record call.
+
+module RmSchema = structure {
+
+  // -- Schema hash (32-byte BLAKE3-truncated placeholder) ---------------
+  //
+  // At M3-001 this is a printable 32-byte placeholder so a consumer
+  // reading the bound hash from the wire can identify it as the
+  // pre-registry version. The M3-registry-integration edit swaps this
+  // for the true BLAKE3-truncated hash of the canonical schema
+  // definition; the schema-registry lookup (libpdx-semantic-pipe.M3)
+  // supplies the runtime resolution.
+  //
+  // 32 bytes exactly -- Binding::libpdx_semantic_pipe_bind reads 32
+  // qword-aligned bytes starting at this pointer (see architecture.md
+  // §3 in libpdx-semantic-pipe).
+  pub let SCHEMA_HASH : [u8; 32] = "RmRecordSchemaHash_M3_placeholde"
+
+  // -- Schema label (for the audit-record output_schema field) ----------
+  //
+  // 17 bytes = "RemoveRecord@0.1" (16) + NUL. RmAudit reads this
+  // pointer when it composes the audit UEJ_KIND_TOOL_OUTPUT record;
+  // see src/audit.pdx §audit_record_target.
+  pub let SCHEMA_LABEL     : [u8; 17] = "RemoveRecord@0.1\0"
+  pub let SCHEMA_LABEL_LEN : u64      = 16
+
+  // -- Wire layout constants ---------------------------------------------
+  //
+  // RECORD_BYTES = 40 = 5 × 8-byte lanes (target_ptr + target_len +
+  // size + was_dir + trash_handle). The number is well within
+  // libpdx-semantic-pipe's SP_MAX_RECORD_BODY (4056) so send_record
+  // never refuses on length grounds.
+  pub let RECORD_BYTES : u64 = 40
+
+  // -- Well-known output fd ---------------------------------------------
+  //
+  // rm binds its RemoveRecord schema against fd 1 (stdout). The
+  // shell.M3 pipe-plumbing lands a KIND_IPC_ENDPOINT here; at HEAD
+  // fd 1 is UART fast-path (see substrate-and-broker note above).
+  pub let STDOUT_FD : u64 = 1
+
+  // -- .bss composition buffer + observability slots --------------------
+  //
+  // _record_scratch is the 40-byte composition buffer record_emit fills
+  // before handing to Send::send_record. One-in-flight-per-process
+  // discipline (mirror of libpdx-semantic-pipe's own _send_payload_buf
+  // shape; see src/send.pdx §.bss composition buffers).
+  //
+  // schema_bind_ok           = 1 if libpdx_semantic_pipe_bind returned
+  //                            SP_OK on the schema_bind_stdout call.
+  // schema_bind_attempts     = number of schema_bind_stdout calls this
+  //                            invocation (always 1 for a correct rm
+  //                            run; > 1 would signal a rm_main re-entry
+  //                            which is not supported at M3).
+  // record_emit_count        = number of successful Send::send_record
+  //                            returns.
+  // record_emit_err_count    = number of non-SP_OK Send::send_record
+  //                            returns; sum with record_emit_count
+  //                            equals the number of record_emit calls,
+  //                            equals removed_count minus wipe_count
+  //                            (wipe path does emit a record — see
+  //                            §Interaction below).
+  pub let mut _record_scratch      : [u64; 5] = uninit @align(8)
+  pub let mut schema_bind_ok       : u64      = uninit @align(8)
+  pub let mut schema_bind_attempts : u64      = uninit @align(8)
+  pub let mut record_emit_count    : u64      = uninit @align(8)
+  pub let mut record_emit_err_count: u64      = uninit @align(8)
+
+  // ============================================================================
+  // schema_reset()
+  //
+  // Signature: schema_reset : () -> () !{mem} @{}
+  //
+  // Zero the four observability slots. Called from
+  // RmRemove::remove_reset (which extends its M2 reset list). The
+  // _record_scratch composition buffer needs no scrub because
+  // record_emit overwrites all 5 lanes on every call.
+  //
+  // Leaf; r11 scratch; no push/pop parity.
+  // ============================================================================
+  pub let schema_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-001 schema_reset. Zero the four observability slots (schema_bind_ok, schema_bind_attempts, record_emit_count, record_emit_err_count). Composition buffer _record_scratch not scrubbed — record_emit overwrites all 5 lanes on every call so a stale value cannot leak. xor rax,rax produces the zero constant; four lea+mov pairs write it. r11 is scratch. Leaf function; no push/pop parity to preserve.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + schema_bind_ok];         mov [r11], rax;
+        lea r11, [rip + schema_bind_attempts];   mov [r11], rax;
+        lea r11, [rip + record_emit_count];      mov [r11], rax;
+        lea r11, [rip + record_emit_err_count];  mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // schema_bind_stdout() -> u64
+  //
+  // Signature: schema_bind_stdout : () -> u64 !{mem, sysreg} @{cap}
+  // RAX (output): 0 on SP_OK, non-zero on any bind refusal (verbatim
+  //               return from Binding::libpdx_semantic_pipe_bind).
+  //
+  // Called once from RmMain::rm_main after RmFlags::flags_scan.
+  // Bumps schema_bind_attempts unconditionally; on SP_OK sets
+  // schema_bind_ok = 1. Failure is non-fatal at M3 (see the substrate-
+  // and-broker note in the file header).
+  //
+  // Register plan (leaf w.r.t. callee-saves; one nested call):
+  //   sub rsp, 8   — align rsp%16 to 0 for the nested Binding call
+  //   rdi = fd (arg 1) = STDOUT_FD
+  //   rsi = schema_id (arg 2) = &SCHEMA_HASH
+  //   rax = bind return code / observability scratch
+  //   r11 = lea scratch (SCHEMA_HASH + .bss slot writes)
+  // ============================================================================
+  pub let schema_bind_stdout : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M3-001 schema_bind_stdout. Bind fd 1 (STDOUT_FD) to the RemoveRecord@0.1 schema hash via Binding::libpdx_semantic_pipe_bind. Bump schema_bind_attempts before the call; on SP_OK (rax == 0) additionally set schema_bind_ok = 1. Failure returns the underlying rc verbatim so a caller can distinguish SP_ERR_INVALID_FD / SP_ERR_NULL_HASH / SP_ERR_ALREADY_BOUND / SP_ERR_TABLE_FULL (see libpdx-semantic-pipe src/binding.pdx §Result codes). Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for the nested call. Effect tail !{mem, sysreg} @{cap} matches the callee (libpdx-semantic-pipe's Binding::libpdx_semantic_pipe_bind is !{mem} @{} but rm's schema_bind_stdout is fronting a syscall-issuing chain via the M3 wiring — sysreg conservative for a future body edit that inlines the send test). r11 scratch: first for lea SCHEMA_HASH, then for the two .bss writes (uses do not overlap). All cmp imm are 0 (post-call SP_OK check). All other immediates are 1 (STDOUT_FD, ok-flag value). Matched add rsp, 8 in both return paths.",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // Bump attempts before the call.
+        lea r11, [rip + schema_bind_attempts];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Arg 1: fd = STDOUT_FD (1).
+        mov rdi, 1;
+        // Arg 2: schema_id = &SCHEMA_HASH.
+        lea rsi, [rip + SCHEMA_HASH];
+        call Binding::libpdx_semantic_pipe_bind;
+
+        // On SP_OK set schema_bind_ok = 1; on error propagate rax.
+        cmp rax, 0;
+        jne schema_bind_out;
+
+        mov rax, 1;
+        lea r11, [rip + schema_bind_ok];
+        mov [r11], rax;
+        xor rax, rax;                          // return SP_OK
+
+      schema_bind_out:
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // record_emit(target_ptr, target_len, was_dir, trash_handle) -> u64
+  //
+  // Signature: record_emit : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap}
+  // RDI (input):  target_ptr    — VA of a NUL-terminated path
+  // RSI (input):  target_len    — byte length of the path (NUL excluded)
+  // RDX (input):  was_dir       — 0 (regular file) or 1 (directory)
+  // RCX (input):  trash_handle  — opaque u64 handle into trash subtree
+  //                               (0 at M3, no trash substrate)
+  // RAX (output): 0 on SP_SEND_OK, non-zero on any send refusal
+  //               (verbatim from Send::send_record).
+  //
+  // Body:
+  //   (1) Serialize the 5-lane record into _record_scratch:
+  //         [0]  = target_ptr
+  //         [8]  = target_len
+  //         [16] = 0                    (size, M3 stub)
+  //         [24] = was_dir
+  //         [32] = trash_handle
+  //   (2) Call Send::send_record(STDOUT_FD, &_record_scratch, 40).
+  //   (3) On SP_OK bump record_emit_count; else bump record_emit_err_count.
+  //
+  // Register plan (2-push + 8-byte pad):
+  //   rbx = trash_handle     (preserved across the composition)
+  //   r12 = &_record_scratch (staged before the call so it survives
+  //                           the callee-save-clobbering send path)
+  //   [rsp+0] = pad          (keeps rsp%16 == 0 at the nested call)
+  //   rax = send return / counter scratch
+  //   rdi/rsi/rdx/rcx = send args
+  //   r11 = lea scratch
+  //
+  // Entry rsp % 16 == 8 → 2-push (16) + sub rsp, 8 (8) → post-prologue
+  // rsp % 16 == 0. Matched add rsp, 8 + 2-pop epilogue.
+  // ============================================================================
+  pub let record_emit : (u64, u64, u64, u64) -> u64 !{mem, sysreg} @{cap} =
+    fn (target_ptr: u64) (target_len: u64) (was_dir: u64) (trash_handle: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M3-001 record_emit. Serialize the 5-lane RemoveRecord (target_ptr, target_len, size=0, was_dir, trash_handle) into _record_scratch and dispatch via Send::send_record(fd=1, &_record_scratch, 40). size is 0 at M3 because the stat-of-inode syscall is not in-tree yet (see file header §Substrate-and-broker note). trash_handle is caller-supplied (0 at M3 because no trash-subtree substrate is live; the caller preserves the field for the M3 → substrate transition without changing signature). 2-push prologue (rbx=trash_handle, r12=&_record_scratch) + sub rsp, 8 pad keeps rsp%16 == 0 at the nested Send::send_record call. rbx preserves trash_handle across the four .bss stores because the stores overwrite rdi/rsi/rdx/rcx as they carry the arg values into _record_scratch; r12 preserves the composition buffer base across the send-call site's caller-save clobber. On SP_OK (rax == 0) bump record_emit_count; on non-zero bump record_emit_err_count. Return the underlying rc verbatim so a caller can classify SP_SEND_ERR_INVALID_FD / SP_SEND_ERR_NULL_REC / SP_SEND_ERR_TOO_LONG / SP_SEND_ERR_NOT_BOUND (libpdx-semantic-pipe src/send.pdx §Result codes). All immediates ≤ 40 fit imm32. r11 scratch used for the composition-store leas and the counter-bump leas (uses do not overlap). Effect tail matches Send::send_record.",
+      block: {
+        // Prologue.
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov rbx, rcx;                          // rbx = trash_handle
+        lea r12, [rip + _record_scratch];      // r12 = &_record_scratch
+
+        // (1) Compose lanes.
+        mov [r12 + 0],  rdi;                   // [0]  = target_ptr
+        mov [r12 + 8],  rsi;                   // [8]  = target_len
+        xor rax, rax;
+        mov [r12 + 16], rax;                   // [16] = size = 0 (M3 stub)
+        mov [r12 + 24], rdx;                   // [24] = was_dir
+        mov [r12 + 32], rbx;                   // [32] = trash_handle
+
+        // (2) Send::send_record(fd=1, rec_ptr=&_record_scratch, rec_len=40).
+        mov rdi, 1;                            // STDOUT_FD
+        mov rsi, r12;
+        mov rdx, 40;                           // RECORD_BYTES
+        call Send::send_record;
+
+        // (3) Observability: bump ok / err counter based on rc.
+        cmp rax, 0;
+        jne record_emit_err;
+
+        lea r11, [rip + record_emit_count];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+        jmp record_emit_done;
+
+      record_emit_err:
+        lea r11, [rip + record_emit_err_count];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+
+      record_emit_done:
+        // Epilogue.
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

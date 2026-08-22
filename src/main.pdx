@@ -1,4 +1,4 @@
-// src/main.pdx — rm.M1-002
+// src/main.pdx — rm.M3-001 (extends M1-002)
 // RmMain module: rm_main(argc, argv) entry point.
 //
 // Scope
@@ -132,6 +132,12 @@ module RmMain = structure {
         // Step 4: reset + scan the flag slots.
         call RmFlags::flags_reset;
         call RmFlags::flags_scan;
+
+        // Step 4b (M3-001): bind fd 1 to the RemoveRecord@0.1 schema.
+        // Failure is non-fatal at M3 (see schema.pdx §Substrate-and-
+        // broker note); observability lives in schema_bind_ok /
+        // schema_bind_attempts.
+        call RmSchema::schema_bind_stdout;
 
         // Step 5: check pos_count. rax = ParsedArgs::pos_count.
         lea r11, [rip + ParsedArgs::pos_count];

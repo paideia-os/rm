@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M2-004 (extends M2-003)
+// src/remove.pdx — rm.M3-001 (extends M2-004)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -128,21 +128,34 @@ module RmRemove = structure {
   // ============================================================================
   // remove_reset()
   //
-  // Signature: remove_reset : () -> () !{mem} @{}
+  // Signature: remove_reset : () -> () !{mem, sysreg} @{cap}
   //
-  // Unchanged from M1-002. Clears removed_count. Leaf; r11 scratch.
+  // At M3-001 this widens from a pure .bss zeroer (M1/M2) to a compound
+  // reset that also delegates to RmSchema::schema_reset. Subsequent M3
+  // commits extend the delegation list (audit_reset, undo_reset,
+  // elevate_reset). Effect tail widened to cover the callee tail sum.
+  //
+  // Prologue: sub rsp, 8 pad (entry rsp%16 == 8 → post-sub 0) for the
+  // nested schema_reset call. Matched add rsp, 8 before ret.
   // ============================================================================
-  pub let remove_reset : () -> () !{mem} @{} =
+  pub let remove_reset : () -> () !{mem, sysreg} @{cap} =
     fn () -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "rm.M2-004 remove_reset. Zero removed_count, the M2-002 confirm counters (confirm_skips_by_f, confirm_prompts_stub), and the M2-004 wipe slots (RmWipe::was_wiped_flag, RmWipe::wipe_count) so a fresh rm_remove_body run starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant reused across all writes.",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M3-001 remove_reset. Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count), then delegate to RmSchema::schema_reset. Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap} to cover the schema-reset callee tail (schema_reset itself is !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the nested call. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
       block: {
+        sub rsp, 8;                                 // rsp%16: 8 → 0
+
         xor rax, rax;
         lea r11, [rip + removed_count];             mov [r11], rax;
         lea r11, [rip + confirm_skips_by_f];        mov [r11], rax;
         lea r11, [rip + confirm_prompts_stub];      mov [r11], rax;
         lea r11, [rip + RmWipe::was_wiped_flag];    mov [r11], rax;
         lea r11, [rip + RmWipe::wipe_count];        mov [r11], rax;
+
+        // Delegate to M3 module resets.
+        call RmSchema::schema_reset;
+
+        add rsp, 8;
         ret
       }
     }
@@ -351,31 +364,41 @@ module RmRemove = structure {
   //          (a shred does not create a trash-subtree entry, so no
   //          retention applies; the audit flag is set for M3-002).
   // ============================================================================
-  pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{} =
+  pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{cap} =
     fn (target_ptr: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M2-004 rm_process_one (extended through M2-001/002/003/004). Flow: (M2-002) confirm_check bumps confirm_skips_by_f (flag_f=1) or confirm_prompts_stub (flag_f=0) and emits F_SKIP_NOTE / PROMPT_STUB_NOTE under -v. Then dispatch: (a) flag_dry_run==1 → fall through to default 'would remove: <target>\\n' path; (b) flag_dry_run==0 AND flag_wipe==1 → RmWipe::wipe_emit handles the full four-part shred emit, sets was_wiped_flag, bumps wipe_count, and short-circuits to done_ok; (c) otherwise → fall through to the default path (Part 1 verbose prefix + Part 2 dry-run prefix + Part 3 target + Part 4 RmRetention::retention_attach + M2_STUB_SUFFIX). Priority order (design/argv-surface.md §3.2): dry-run beats wipe beats default. No filesystem side effects at M2 (mutating PdxFS substrate not in-tree; see mv.M1-003 for the same discipline). 1-push prologue (rbx) preserves target_ptr across confirm_check + wipe_emit + retention_attach + up to four Print::print_str syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access via lea r11, [rip + sym]. Bumps removed_count (per rm_process_one call). Return: pop rbx, xor rax,rax, ret — exit code always 0 at M2.",
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M3-001 rm_process_one (extended through M2-004). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then M3-001 record_emit fires (RemoveRecord@0.1 with target_ptr + target_len + was_dir=0 + trash_handle=0). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hook (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints retention_attach + M3-001 record_emit + M2_STUB_SUFFIX. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site. rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail widened to !{mem, sysreg} @{cap} to cover the semantic-pipe send-record call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
       block: {
-        // Prologue: preserve target_ptr across confirm_check + Print calls.
+        // Prologue: preserve target_ptr + target_len across every hook.
         push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
         mov rbx, rdi;                          // rbx = target_ptr
 
-        // ---- M2-002: confirm gate (proceeds unconditionally at M2) ------
-        // confirm_check bumps exactly one of confirm_skips_by_f /
-        // confirm_prompts_stub per call and optionally emits a stub note
-        // under -v. Returns unit at M2 (M3 will return proceed/abort).
+        // ---- Compute target_len via NUL-walk (once, stashed in r12) ----
+        // Every M3 hook needs the length available; a single up-front
+        // compute is cheaper than a per-hook re-walk.
+        mov rdx, rbx;                          // cursor = target_ptr
+
+      rm_process_len_walk:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je rm_process_len_done;
+        add rdx, 1;
+        jmp rm_process_len_walk;
+
+      rm_process_len_done:
+        mov r12, rdx;
+        sub r12, rbx;                          // r12 = target_len
+
+        // ---- M2-002: confirm gate (proceeds unconditionally at M2/M3) ---
         mov rdi, rbx;                          // arg = target_ptr
         call confirm_check;
 
-        // ---- M2-004: --wipe short-circuit (skips retention + stub) ------
-        // Priority order (design/argv-surface.md §3.2):
-        //   1. --dry-run beats --wipe → dry-run takes the existing
-        //      "would remove: <target>\n" path with no real side effects.
-        //   2. --wipe (without --dry-run) → RmWipe::wipe_emit handles the
-        //      full shred line (verbose prefix + "shred: " + target +
-        //      WIPE_STUB_SUFFIX), sets was_wiped_flag = 1, bumps
-        //      wipe_count. Retention does not apply (no trash entry).
-        //   3. Otherwise → fall through to Part 1 (verbose) below.
+        // ---- M2-004: --wipe short-circuit -------------------------------
+        // Priority: dry-run beats wipe beats default.
         lea r11, [rip + RmFlags::flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
@@ -386,10 +409,18 @@ module RmRemove = structure {
         cmp rax, 0;
         je rm_process_part1;                   // no wipe: default path
 
-        // --wipe branch: full emit + audit-flag set + counter bump.
+        // --wipe branch: shred emit, then M3-001 record emit.
         mov rdi, rbx;                          // arg = target_ptr
         call RmWipe::wipe_emit;
-        jmp rm_process_done_ok;                // skip retention + stub
+
+        // M3-001 record emit (wipe path).
+        mov rdi, rbx;                          // target_ptr
+        mov rsi, r12;                          // target_len
+        xor rdx, rdx;                          // was_dir = 0 (M3 stub)
+        xor rcx, rcx;                          // trash_handle = 0 (M3 stub)
+        call RmSchema::record_emit;
+
+        jmp rm_process_done_ok;
 
       rm_process_part1:
         // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
@@ -415,30 +446,20 @@ module RmRemove = structure {
 
       rm_process_skip_dry_prefix:
         // ---- Part 3: print the target string ----------------------------
-        mov rdx, rbx;
-
-      rm_process_walk_target:
-        xor rax, rax;
-        mov_b rax, [rdx];
-        cmp rax, 0;
-        je rm_process_walk_done;
-        add rdx, 1;
-        jmp rm_process_walk_target;
-
-      rm_process_walk_done:
-        // Print the target: rdi = rbx (buffer), rsi = rdx - rbx (length).
-        mov rdi, rbx;
-        mov rsi, rdx;
-        sub rsi, rbx;
+        // r12 already holds target_len — no second walk needed.
+        mov rdi, rbx;                          // buffer
+        mov rsi, r12;                          // length
         call Print::print_str;
 
-        // ---- Part 4: trailing suffix (dry-run → '\n'; else → M2 stub) ---
+        // ---- Part 4: trailing suffix (dry-run → '\n' with NO M3 hook;
+        //              else → retention_attach + record_emit + M2 stub) -
         lea r11, [rip + RmFlags::flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         je rm_process_print_m2_suffix;
 
-        // Dry-run: just a newline.
+        // Dry-run: just a newline. NO M3 hook — dry-run is by design
+        // non-emitting; the M3 record set describes real removals only.
         lea rdi, [rip + NEWLINE];
         mov rsi, 1;                            // NEWLINE_LEN
         call Print::print_str;
@@ -446,12 +467,17 @@ module RmRemove = structure {
 
       rm_process_print_m2_suffix:
         // ---- M2-003: attach 24h retention deadline metadata --------------
-        // retention_attach bumps its counter, stores 24h ns into its
-        // deadline observable, and emits a 31-byte note under -v. See
-        // src/retention.pdx for the mov r11, imm64 staging discipline.
         mov rdi, rbx;                          // arg = target_ptr
         call RmRetention::retention_attach;
 
+        // ---- M3-001: record emit (default path) --------------------------
+        mov rdi, rbx;
+        mov rsi, r12;
+        xor rdx, rdx;
+        xor rcx, rcx;
+        call RmSchema::record_emit;
+
+        // ---- M2 stub suffix (visual: names the substrate gap) -----------
         lea rdi, [rip + M2_STUB_SUFFIX];
         mov rsi, 61;                           // M2_STUB_SUFFIX_LEN
         call Print::print_str;
@@ -464,7 +490,9 @@ module RmRemove = structure {
         add rax, 1;
         mov [r11], rax;
 
-        // Epilogue: restore rbx, load exit code 0.
+        // Epilogue.
+        add rsp, 8;                            // undo pad
+        pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK
         ret
