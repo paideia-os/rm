@@ -1,0 +1,224 @@
+// src/undo.pdx -- rm.M3-003
+// RmUndo module: PdxFS v1 undo record composition (replay reconstructs
+// from trash subtree).
+//
+// Scope
+// -----
+// This module implements the M3-003 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M3-003 line): "PdxFS v1 undo record (replay
+// reconstructs from trash)". Every non-wipe rm target ships one undo
+// record on the PdxFS v1 undo log so `undo rm <target>` (within the
+// 24-hour retention window from RmRetention) can move the trash
+// subtree entry back to its original location.
+//
+// The undo-record wire layout at v0.1 is six u64-typed fields (48
+// bytes total):
+//
+//   [0..8]   op_kind             — UNDO_OP_RM (= 1); tags the record
+//                                   so a shared undo replayer can
+//                                   dispatch on it
+//   [8..16]  target_ptr          — VA of the NUL-terminated original
+//                                   path at removal time. Interior
+//                                   pointer into the emitting process's
+//                                   argv (consumer treats as snapshot)
+//   [16..24] target_len          — byte length of the path (NUL excl)
+//   [24..32] trash_handle        — opaque u64 handle into the trash
+//                                   subtree entry. At M3 always 0
+//                                   (no trash-subtree substrate)
+//   [32..40] retention_deadline_ns — RmRetention::retention_deadline_ns
+//                                   at emission time (absolute-time
+//                                   snapshot; undo replayer refuses
+//                                   after this)
+//   [40..48] was_dir             — 0 (regular file) or 1 (directory)
+//
+// The layout deliberately keeps op_kind at offset 0 so a byte-scanner
+// walking the undo log can dispatch on the first qword without decoding
+// the trailer.
+//
+// Interaction with --wipe
+// -----------------------
+// --wipe skips the trash-subtree move entirely (RmWipe::wipe_emit at
+// M2-004), so no trash entry exists to point back to and no undo
+// record applies. The undo write is called ONLY from the non-wipe
+// path in RmRemove::rm_process_one; RmWipe::wipe_emit does not call
+// undo_write and the M4-004 "--wipe audit flag correctness" test
+// asserts undo_write_count stays baseline across a pure --wipe
+// invocation. This matches the D3 forensic-detection invariant: a
+// forensic reader distinguishes intentional shred from later reap by
+// (a) was_wiped_flag on the audit record AND (b) absence of an undo
+// record for the target.
+//
+// Substrate note
+// --------------
+// The PdxFS v1 undo log (sys_pdxfs_undo_append or the equivalent
+// userspace log-writer) is not in-tree at HEAD. M3-003 composes the
+// 6-lane record into a per-invocation .bss scratch buffer and bumps
+// observability counters (undo_write_count + undo_write_bytes); it
+// does NOT commit the record to any syscall. The M3 → substrate
+// transition edits undo_write to append the scratch contents to the
+// live undo log at the same call site — signature stays intact.
+//
+// Same "faithfully emit shape without inventing outcome" discipline
+// the M2 skeleton observes for the PdxFS mutating ops.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmUndo (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0, 1, 48 appear).
+//   - r11 is scratch (used for every lea).
+//   - No byte reads (all qword-wide composition).
+//   - undo_write prologue: 1-push (rbx) preserves trash_handle across
+//     the NUL-walk. Entry rsp % 16 == 8; push brings it to 0. No
+//     nested calls at M3 (composition + counter bump only); the M3 →
+//     substrate transition adds a nested sys_pdxfs_undo_append call
+//     whose alignment is a body-edit concern.
+
+module RmUndo = structure {
+
+  // -- Record layout constants ------------------------------------------
+  //
+  // op_kind discriminator for the trash-move undo record. Other kinds
+  // (UNDO_OP_MV, UNDO_OP_CP_OVER) live in the mv / cp repos; the shared
+  // undo-log format schedule (design/tooling/plan.md §I5) allocates
+  // 0..15 for the P0 tool set with 1 reserved for rm.
+  pub let UNDO_OP_RM : u64 = 1
+
+  // 6 × 8-byte lanes = 48 bytes. Well within any conceivable
+  // undo-log frame cap.
+  pub let UNDO_RECORD_BYTES : u64 = 48
+
+  // -- .bss composition buffer + observability slots --------------------
+  //
+  // _undo_scratch is the 48-byte composition buffer undo_write fills
+  // before (at M3+substrate) handing to the undo-log append routine.
+  // One-in-flight-per-process discipline (same shape as
+  // RmSchema::_record_scratch).
+  //
+  // undo_write_count       — number of undo_write calls. Equals
+  //                          removed_count minus wipe_count under a
+  //                          correct rm invocation.
+  // undo_write_bytes       — cumulative bytes composed (48 * count at
+  //                          M3; the substrate transition upgrades
+  //                          this to bytes-actually-appended-to-log).
+  // undo_last_deadline_ns  — snapshot of retention_deadline_ns at the
+  //                          most recent undo_write call. M4-002
+  //                          reads this to verify the deadline
+  //                          matches RmRetention's value.
+  pub let mut _undo_scratch         : [u64; 6] = uninit @align(8)
+  pub let mut undo_write_count      : u64      = uninit @align(8)
+  pub let mut undo_write_bytes      : u64      = uninit @align(8)
+  pub let mut undo_last_deadline_ns : u64      = uninit @align(8)
+
+  // ============================================================================
+  // undo_reset()
+  //
+  // Signature: undo_reset : () -> () !{mem} @{}
+  //
+  // Zero the three observability slots. Called from
+  // RmRemove::remove_reset. Leaf.
+  // ============================================================================
+  pub let undo_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-003 undo_reset. Zero the three observability slots (undo_write_count, undo_write_bytes, undo_last_deadline_ns) so a fresh rm_main invocation starts baseline. Composition buffer _undo_scratch not scrubbed — undo_write overwrites all 6 lanes on every call so a stale value cannot leak. xor rax,rax produces the zero constant; three lea+mov pairs write it. r11 scratch. Leaf function; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + undo_write_count];      mov [r11], rax;
+        lea r11, [rip + undo_write_bytes];      mov [r11], rax;
+        lea r11, [rip + undo_last_deadline_ns]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // undo_write(target_ptr, target_len, was_dir, trash_handle) -> u64
+  //
+  // Signature: undo_write : (u64, u64, u64, u64) -> u64 !{mem} @{}
+  // RDI (input):  target_ptr    — VA of a NUL-terminated original path
+  // RSI (input):  target_len    — byte length (NUL excluded)
+  // RDX (input):  was_dir       — 0 / 1
+  // RCX (input):  trash_handle  — opaque u64 (0 at M3)
+  // RAX (output): 0 on success (M3 always succeeds — composition-only;
+  //               the substrate transition upgrades to sys_pdxfs_undo_
+  //               append's rc).
+  //
+  // Body:
+  //   (1) Serialize the 6-lane record into _undo_scratch:
+  //         [0]  = UNDO_OP_RM (1)
+  //         [8]  = target_ptr
+  //         [16] = target_len
+  //         [24] = trash_handle
+  //         [32] = RmRetention::retention_deadline_ns (snapshot)
+  //         [40] = was_dir
+  //   (2) Bump undo_write_count.
+  //   (3) Add UNDO_RECORD_BYTES (48) to undo_write_bytes.
+  //   (4) Snapshot RmRetention::retention_deadline_ns to
+  //       undo_last_deadline_ns.
+  //
+  // Register plan (1-push prologue):
+  //   rbx = trash_handle    (preserved across the load of
+  //                          retention_deadline_ns which uses rax)
+  //   rax = temp / composition scratch / counter scratch
+  //   r11 = lea scratch (uses are sequential; no overlap)
+  //   rdi, rsi, rdx, rcx = arg carriers (consumed into _undo_scratch)
+  //
+  // Entry rsp % 16 == 8 → push rbx → rsp % 16 == 0. Pop rbx on
+  // return.
+  // ============================================================================
+  pub let undo_write : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) (target_len: u64) (was_dir: u64) (trash_handle: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-003 undo_write. Compose the 6-lane trash-move undo record ([UNDO_OP_RM, target_ptr, target_len, trash_handle, retention_deadline_ns, was_dir]) into _undo_scratch and bump observability counters. No syscall at M3 — the PdxFS v1 undo-log substrate (sys_pdxfs_undo_append or userspace log-writer) is not in-tree; the M3 → substrate transition edits this body to append the composed record at the same call site (signature stays intact). rbx preserves trash_handle across the retention_deadline_ns load which uses rax as scratch — the store of trash_handle into _undo_scratch[24] happens BEFORE the retention load so a peek-in-flight sees the correct value. 1-push prologue (rbx) preserves trash_handle across the load and keeps rsp%16 == 0 for the (deferred; M3 has no nested call) substrate call. All immediates ≤ 48 fit imm32. r11 scratch: first for lea _undo_scratch, then for the RmRetention::retention_deadline_ns load, then for the three counter/snapshot writes (uses do not overlap). Return: pop rbx, xor rax,rax, ret — always 0 at M3.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+        mov rbx, rcx;                          // rbx = trash_handle
+
+        // (1) Compose lanes. Order-independent within the 48-byte block
+        //     — no overlap between fields, no aliasing.
+        lea r11, [rip + _undo_scratch];
+
+        mov rax, 1;                            // UNDO_OP_RM
+        mov [r11 + 0],  rax;                   // [0]  = op_kind
+        mov [r11 + 8],  rdi;                   // [8]  = target_ptr
+        mov [r11 + 16], rsi;                   // [16] = target_len
+        mov [r11 + 24], rbx;                   // [24] = trash_handle
+        mov [r11 + 40], rdx;                   // [40] = was_dir
+
+        // (5) Snapshot the current retention deadline into slot [32]
+        //     and into the observability slot. RmRetention writes
+        //     retention_deadline_ns BEFORE rm_process_one calls
+        //     undo_write (retention_attach runs first in the
+        //     rm_process_one flow), so the load here is well-defined.
+        //     r11 gets reused as the RmRetention .bss base for the
+        //     load; the composition writes above have already
+        //     committed so the base-swap is safe.
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov rax, [r11];
+
+        lea r11, [rip + _undo_scratch];
+        mov [r11 + 32], rax;                   // [32] = retention snap
+
+        lea r11, [rip + undo_last_deadline_ns];
+        mov [r11], rax;                        // observability snap
+
+        // (2) Bump undo_write_count.
+        lea r11, [rip + undo_write_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // (3) Add UNDO_RECORD_BYTES to undo_write_bytes.
+        lea r11, [rip + undo_write_bytes];
+        mov rax, [r11];
+        add rax, 48;                           // UNDO_RECORD_BYTES
+        mov [r11], rax;
+
+        // Return 0 (success at M3; substrate transition returns the
+        // append syscall's rc).
+        pop rbx;
+        xor rax, rax;
+        ret
+      }
+    }
+}
