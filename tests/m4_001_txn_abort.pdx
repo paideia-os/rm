@@ -1,0 +1,196 @@
+// tests/m4_001_txn_abort.pdx -- rm.M4-001
+// M4Test001 module: TXN-abort mid-remove: no files removed.
+//
+// Scope
+// -----
+// This module implements the M4-001 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M4-001 line): "TXN-abort mid-remove: no files
+// removed". The invariant under test is: if the PdxFS v1 transaction
+// spanning an rm invocation aborts before commit, NO trash-move is
+// durable and NO forensic side effect (retention_attach / undo_write /
+// record_emit / audit_records_out) is observable to a downstream
+// consumer.
+//
+// Substrate proxy at M4 (test-shape without live TXN abort)
+// ---------------------------------------------------------
+// The mutating PdxFS ops (sys_pdxfs_txn_open / sys_pdxfs_move /
+// sys_pdxfs_txn_abort / sys_pdxfs_txn_commit) are not in-tree at HEAD
+// -- kernel exposes six QUERY_* ops on KIND_PDXFS_FILE (paideia-os
+// src/kernel/core/cap/kind_pdxfs_file.pdx L94-99) and six QUERY_* ops
+// on KIND_PDXFS_TXN (kind_pdxfs_txn.pdx L91-96). Without a live TXN,
+// the test cannot inject an abort mid-remove; instead it exercises
+// the closest structurally-equivalent path: --dry-run.
+//
+// The dry-run branch through rm_process_one is by construction the
+// same "no observable side effects" shape a TXN-aborted remove would
+// leave: Part 4 (design/argv-surface.md §3.2) dispatches on
+// flag_dry_run and takes the `"\n"` + NO M3 hooks branch when set.
+// Both branches skip:
+//
+//   * RmRetention::retention_attach  (retention_attach_count stays 0)
+//   * RmUndo::undo_write             (undo_write_count stays 0)
+//   * RmSchema::record_emit          (record_emit_count stays 0)
+//   * RmAudit::audit_record_target   (audit_records_out stays 0)
+//
+// removed_count still bumps in the dry-run path (rm_process_done_ok
+// is reachable from both branches); the real-TXN-abort proxy at M5
+// substrate landing extends this test to verify the same four M3
+// counters stay 0 AND that removed_count STAYS 0 when the abort path
+// is triggered (a real abort produces neither user-visible progress
+// nor a bumped completion counter).
+//
+// M4 test invariant asserted here
+// -------------------------------
+// After one rm_process_one call with flag_dry_run = 1 and all other
+// flags clear on a synthetic non-/system/ target:
+//
+//   RmRetention::retention_attach_count == 0
+//   RmUndo::undo_write_count             == 0
+//   RmSchema::record_emit_count          == 0
+//   RmAudit::audit_records_out           == 0
+//   RmRemove::removed_count              == 1  (dry-run reaches
+//                                                rm_process_done_ok)
+//
+// Any divergence prints the M4-001 FAIL fingerprint and returns 1.
+// A clean run prints the M4-001 OK fingerprint and returns 0.
+//
+// Reset-list observation
+// ----------------------
+// RmRemove::remove_reset zeros the M1/M2 counters + delegates to the
+// four M3 module resets, but does NOT zero RmRetention slots or the
+// two RmWalk slots (walk.pdx L99-105 documents this as an M4-covered
+// gap). This test therefore explicitly zeros retention_attach_count
+// and retention_deadline_ns before every run -- an M5 substrate
+// commit expands remove_reset to include them.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module M4Test001 (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (only 0 and 1 appear).
+//   - r11 is scratch (used for every .bss lea).
+//   - No byte reads (all qword-wide observability checks).
+//   - run_m4_001 prologue: sub rsp, 8 pad = 8 bytes; entry rsp % 16
+//     == 8, post-sub rsp % 16 == 0 for every nested call site
+//     (remove_reset, flags_reset, rm_process_one, print_str).
+
+module M4Test001 = structure {
+
+  // -- Target string used by the synthetic invocation ------------------
+  // 12 bytes = "test_target\0". Length 11 (NUL excluded); the trailing
+  // NUL lets rm_process_one's NUL-walk terminate cleanly.
+  pub let TEST_TARGET : [u8; 12] = "test_target\0"
+
+  // -- Fingerprint lines emitted to stdout via Print::print_str --------
+  //
+  // Compact 15/17-byte lines so the smoke driver's substring match is
+  // unambiguous. tests/expected-m4-fingerprints.txt lists the OK line.
+  pub let OK_MSG     : [u8; 15] = "[rm.M4-001 OK]\n"
+  pub let OK_MSG_LEN : u64      = 15
+
+  pub let FAIL_MSG     : [u8; 17] = "[rm.M4-001 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 17
+
+  // ============================================================================
+  // run_m4_001() -> u64
+  //
+  // Signature: run_m4_001 : () -> u64 !{mem, sysreg} @{cap, sched}
+  // RAX (output): 0 = OK, 1 = FAIL.
+  //
+  // Body:
+  //   (1) reset rm state (RmRemove::remove_reset + RmFlags::flags_reset).
+  //   (2) zero the two RmRetention slots not covered by remove_reset.
+  //   (3) set RmFlags::flag_dry_run = 1; leave others 0.
+  //   (4) invoke RmRemove::rm_process_one(&TEST_TARGET).
+  //   (5) assert every M3 counter stays 0; removed_count == 1.
+  //   (6) print OK or FAIL fingerprint; return 0 or 1.
+  //
+  // Effect tail !{mem, sysreg} @{cap, sched} covers the audit + schema
+  // + elevate fanout inside rm_process_one (although the dry-run path
+  // does not fire those hooks, the callee's declared tail is a
+  // superset the caller must commit to).
+  //
+  // Register plan (leaf w.r.t. callee-saves; every nested call takes
+  // aligned rsp):
+  //   sub rsp, 8   -- align rsp%16 to 0 for every nested call
+  //   rax = counter/store scratch + call return
+  //   rdi = call arg 1 (target_ptr for rm_process_one; buf for print_str)
+  //   rsi = call arg 2 (len for print_str)
+  //   r11 = lea scratch (every .bss / .rodata access)
+  // ============================================================================
+  pub let run_m4_001 : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M4-001 run_m4_001. Sets up the dry-run substrate proxy for TXN-abort mid-remove: resets rm state (RmRemove::remove_reset + RmFlags::flags_reset), explicitly zeros the two RmRetention slots that remove_reset does not cover (walk.pdx L99-105 documents this reset-list gap; the M5 substrate commit expands remove_reset), sets flag_dry_run = 1, and invokes rm_process_one on a synthetic non-/system/ target. Asserts the four M3 counters (retention_attach_count, undo_write_count, record_emit_count, audit_records_out) stay 0 and removed_count == 1 -- the dry-run branch through rm_process_one skips every M3 hook (remove.pdx L483-495 documents 'dry-run is by design non-emitting; the M3 record set describes real removals only') and reaches rm_process_done_ok which bumps removed_count. Any divergence prints the FAIL fingerprint and returns 1; a clean run prints OK and returns 0. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for every nested call site (remove_reset, flags_reset, rm_process_one, print_str). r11 scratch: sequential uses across the reset-slot writes, the flag write, and every counter read; no overlap because each use writes to its slot before the next lea replaces r11. All immediates 0 or 1. Effect tail matches rm_process_one's callee tail (which itself covers the audit/schema/elevate fanout).",
+      block: {
+        sub rsp, 8;                              // rsp%16: 8 -> 0
+
+        // (1) Reset rm state.
+        call RmRemove::remove_reset;
+        call RmFlags::flags_reset;
+
+        // (2) Zero RmRetention slots not covered by remove_reset.
+        xor rax, rax;
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov [r11], rax;
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov [r11], rax;
+
+        // (3) Set flag_dry_run = 1.
+        mov rax, 1;
+        lea r11, [rip + RmFlags::flag_dry_run];
+        mov [r11], rax;
+
+        // (4) Invoke rm_process_one on the synthetic target.
+        lea rdi, [rip + TEST_TARGET];
+        call RmRemove::rm_process_one;
+
+        // (5) Assertions.
+        //     retention_attach_count == 0
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_001_fail;
+
+        //     undo_write_count == 0
+        lea r11, [rip + RmUndo::undo_write_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_001_fail;
+
+        //     record_emit_count == 0
+        lea r11, [rip + RmSchema::record_emit_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_001_fail;
+
+        //     audit_records_out == 0
+        lea r11, [rip + RmAudit::audit_records_out];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_001_fail;
+
+        //     removed_count == 1 (dry-run still reaches rm_process_done_ok)
+        lea r11, [rip + RmRemove::removed_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_001_fail;
+
+        // (6) OK path: print OK_MSG, return 0.
+        lea rdi, [rip + OK_MSG];
+        mov rsi, 15;                             // OK_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        xor rax, rax;                            // 0 = OK
+        ret
+
+      m4_001_fail:
+        lea rdi, [rip + FAIL_MSG];
+        mov rsi, 17;                             // FAIL_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        mov rax, 1;                              // 1 = FAIL
+        ret
+      }
+    }
+}

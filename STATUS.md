@@ -1,7 +1,7 @@
 # rm — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M3 (audit + undo + elevate) — complete
+**Current milestone:** M4 (tests + smoke) — in progress
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
 breakdown.
@@ -85,6 +85,20 @@ breakdown.
   top-level target (walk-per-entry hook lands with the substrate
   transition).
 
+## M4 — tests + smoke (in progress)
+
+- `tests/m4_001_txn_abort.pdx` (issue #12, M4-001): TXN-abort mid-
+  remove: no files removed. Uses `--dry-run` as the substrate proxy
+  for TXN-abort mid-remove -- both branches produce zero observable
+  side effects on `RmRetention::retention_attach_count`,
+  `RmUndo::undo_write_count`, `RmSchema::record_emit_count`, and
+  `RmAudit::audit_records_out`. `removed_count == 1` because dry-run
+  reaches `rm_process_done_ok`; the M5 substrate patch extends this
+  test to verify a live abort keeps `removed_count == 0` too.
+  Fingerprint: `[rm.M4-001 OK]` / `[rm.M4-001 FAIL]`. Also documents
+  the reset-list gap in `RmRemove::remove_reset` (retention slots +
+  walk slots not covered) and zeros them at test entry.
+
 ## Milestone rollup
 
 | ID           | Title                                                              | State  |
@@ -100,6 +114,10 @@ breakdown.
 | M3-002 (#9)  | RemoveRecord via libpdx-audit before trash-move                    | LANDED |
 | M3-003 (#10) | PdxFS v1 undo record (replay reconstructs from trash)              | LANDED |
 | M3-004 (#11) | libpdx-elevate for /system/ + cross-subtree targets                | LANDED |
+| M4-001 (#12) | TXN-abort mid-remove: no files removed                             | LANDED |
+| M4-002 (#13) | undo within retention window succeeds                              | TBD    |
+| M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | TBD    |
+| M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | TBD    |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
