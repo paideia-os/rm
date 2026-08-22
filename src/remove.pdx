@@ -1,79 +1,111 @@
-// src/remove.pdx — rm.M1-002 skeleton (upgraded at rm.M1-003)
+// src/remove.pdx — rm.M1-003 (upgraded from the M1-002 skeleton)
 // RmRemove module: the rm removal body.
 //
-// Scope at M1-002 (this file)
-// ---------------------------
-// This is the SKELETON that lands with the argv surface. It exposes
-// the `rm_remove_body(target_ptr)` entry point so `RmMain::rm_main`
-// can wire the call site at parse-and-validate close. At M1-002 the
-// body is a no-op that returns `EXIT_OK` (0) — the binary walks the
-// full argv → parse → scan → dispatch chain and exits cleanly, but
-// no user-visible output is produced by this module.
+// Scope at M1-003 (this milestone)
+// --------------------------------
+// M1-003 lands the first-runnable body: read the caller-supplied
+// target_ptr, honour `--dry-run` and `-v` from the RmFlags .bss
+// slots, print a single-line placeholder on stdout naming the
+// target, and return `EXIT_OK` (0). No real filesystem work happens
+// yet — see design/architecture.md §6 for why the R48-close
+// substrate cannot open a live PdxFS transaction and trash-move the
+// target (both KIND_PDXFS_FILE and KIND_PDXFS_TXN are query-only at
+// HEAD, and the mutating-op set is scheduled for §5.8 M2).
 //
-// The M1-003 upgrade replaces this body with the first-runnable
-// placeholder: read the caller-supplied target pointer, honour
-// `--dry-run` and `-v`, print a single-line placeholder on stdout,
-// return `EXIT_OK`. The signature is frozen at M1-002 so the M1-003
-// upgrade is a body edit inside rm_remove_body and does NOT change
-// `RmMain::rm_main`.
+// The M1-003 body walks the target string to compute its length,
+// emits the four-part output line via `Print::print_str`:
 //
-// The `remove_reset()` companion clears a per-invocation counter
-// slot. At M1-002 the slot is unused; M2-001's leaf-first recursive
-// walk populates it with the number of files trashed so the M4
-// tests can assert the count without a downstream print. The slot
-// is introduced now so the M2 patch is a body edit inside
-// pkg_remove_body's loop, not a new .bss allocation.
+//   [optional] "rm: "               when RmFlags::flag_v == 1
+//   [conditional prefix]            "would remove: " (dry-run) OR "" (default)
+//   <target bytes>                  the caller's positional string
+//   [conditional suffix]            "\n" (dry-run) OR the M1-stub suffix
+//
+// The M1-stub suffix is:
+//   ": (M1 stub -- real trash-move via TXN lands at M2)\n"
+//
+// This mirrors the pkg.M1 `pkg list` placeholder that names the
+// milestone at which the real body lands, so a user reading the
+// stdout in M1 sees immediately that this is a stub and where in
+// the roadmap the real work is scheduled.
+//
+// Signature is unchanged from M1-002 — the upgrade is body-only,
+// which is why `RmMain::rm_main` needs no edit.
+//
+// Downstream body upgrades (per §5.8 in the plan doc):
+//   M2-001: recursive `-r` leaf-first walk under a single TXN.
+//   M2-002: `-f` skip confirmation (M1 has none to skip).
+//   M2-003: 24h retention deadline metadata on trash-subtree entry.
+//   M2-004: `--wipe` immediate trash-unlink + best-effort byte
+//           overwrite where the underlying device supports it.
+//   M3-001..004: RemoveRecord[] emission + audit + undo + elevate.
 //
 // paideia-as compliance
 // ---------------------
 //   - Module RmRemove (PascalCase basename).
-//   - No test mnemonic.
-//   - r11 is scratch.
-//   - Leaf functions at M1-002; the M1-003 upgrade takes one push
-//     (rbx) to preserve target_ptr across nested Print::print_str
-//     calls.
+//   - No test mnemonic; every zero-check uses cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0 and single-byte
+//     char codes appear in immediates here).
+//   - r11 is scratch (used in every lea for .rodata bases and for
+//     the RmFlags .bss reads).
+//   - Byte reads use xor rax, rax; mov_b rax, [ptr] per the #1248
+//     mitigation (the NUL-walk on the target).
+//   - 1-push prologue (rbx) preserves the target_ptr across the
+//     up-to-four nested Print::print_str syscalls. rsp % 16 was 8
+//     on SysV entry; push rbx brings it to 0 which satisfies the
+//     alignment invariant for every nested syscall.
 
 module RmRemove = structure {
 
   // -- Exit codes shared with RmMain -----------------------------------
-  // Consumer (dispatch table at RmMain) matches on:
-  //   0 EXIT_OK              — the operation succeeded
-  //   1 EXIT_OP_FAIL         — the operation failed (M2+ paths)
-  //   2 EXIT_USAGE           — argv-surface error (handled by RmMain)
-  //   3 EXIT_NOT_YET_IMPL    — recognised but not implemented at this M
-  //
-  // rm at M1 only ever returns 0 (the M1-003 placeholder always
-  // succeeds); the codes are declared here so downstream milestones
-  // return them from this same module.
   pub let EXIT_OK             : u64 = 0
   pub let EXIT_OP_FAIL        : u64 = 1
   pub let EXIT_USAGE          : u64 = 2
   pub let EXIT_NOT_YET_IMPL   : u64 = 3
 
   // -- Per-invocation counter (populated at M2-001) --------------------
-  // Number of files trashed in the current rm_main call. M1-002 leaves
-  // this at zero; M1-003's placeholder body reads but does not write
-  // it. M2-001's recursive walk increments it per successful trash-
-  // move. M4's tests inspect this slot to assert the count matches
-  // the expected leaf-first traversal.
+  // See the M1-002 preamble for the M2 semantics.
   pub let mut removed_count : u64 = uninit @align(8)
+
+  // -- M1-003 output message pieces ------------------------------------
+  // Each is emitted via one Print::print_str call; the byte-lengths
+  // are hand-computed and pinned as u64 constants so the M1 body can
+  // pass them to print_str without a runtime strlen.
+
+  // "rm: " — printed when RmFlags::flag_v == 1, before any other
+  // prefix. Four bytes: 'r' 'm' ':' ' '.
+  pub let VERBOSE_PREFIX     : [u8; 4]   = "rm: "
+  pub let VERBOSE_PREFIX_LEN : u64       = 4
+
+  // "would remove: " — printed when RmFlags::flag_dry_run == 1,
+  // after any verbose prefix but before the target bytes. 14 bytes.
+  pub let DRY_RUN_PREFIX     : [u8; 14]  = "would remove: "
+  pub let DRY_RUN_PREFIX_LEN : u64       = 14
+
+  // "\n" — the trailing byte when flag_dry_run is set. The
+  // dry-run output line is "[rm: ]would remove: <target>\n".
+  pub let NEWLINE            : [u8; 1]   = "\n"
+  pub let NEWLINE_LEN        : u64       = 1
+
+  // The M1-stub suffix. Emitted when flag_dry_run is NOT set. The
+  // default output line is "[rm: ]<target>: (M1 stub -- real trash-
+  // move via TXN lands at M2)\n" (51 bytes).
+  pub let M1_STUB_SUFFIX     : [u8; 51]  =
+    ": (M1 stub -- real trash-move via TXN lands at M2)\n"
+  pub let M1_STUB_SUFFIX_LEN : u64       = 51
 
   // ============================================================================
   // remove_reset()
   //
   // Signature: remove_reset : () -> () !{mem} @{}
   //
-  // Clear removed_count. Called by RmMain::rm_main before
-  // rm_remove_body so a subsequent invocation starts from a known-
-  // zero baseline (relevant when the shell reuses one rm binary
-  // across multiple commands in a subshell).
-  //
-  // Leaf; r11 scratch; no callee-save touched.
+  // Unchanged from M1-002. Clears removed_count. See the M1-002
+  // preamble comment (preserved on the module doc block above) for
+  // the M2 role of the slot.
   // ============================================================================
   pub let remove_reset : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "rm.M1-002 remove_reset. Zero removed_count so rm_remove_body starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant.",
+      justification: "rm.M1-003 remove_reset (unchanged from M1-002). Zero removed_count so rm_remove_body starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant.",
       block: {
         xor rax, rax;
         lea r11, [rip + removed_count];
@@ -88,31 +120,97 @@ module RmRemove = structure {
   // Signature: rm_remove_body : (u64) -> u64 !{mem, sysreg} @{}
   // RDI (input): target_ptr — VA of a NUL-terminated path (from
   //                            ParsedArgs::pos_ptrs[0])
-  // RAX (output): 0 (EXIT_OK) at M1-002; upgraded at M1-003
+  // RAX (output): 0 (EXIT_OK) — M1-003 always succeeds
   //
-  // M1-002 body (this file): return 0 immediately. The M1-003 upgrade
-  // reads RmFlags::flag_v / flag_dry_run, selects one of three
-  // .rodata message templates, and prints "target: <path>\n" on
-  // stdout via Print::print_str. The signature and call site are
-  // frozen at M1-002.
+  // M1-003 body: honour flag_v + flag_dry_run + print the placeholder
+  // line, then return EXIT_OK. See the module preamble for the
+  // four-part output-line shape.
   //
-  // Downstream body upgrades (per §5.8 in the plan doc):
-  //   M2-001: recursive `-r` leaf-first walk under a single TXN.
-  //   M2-002: `-f` skip confirmation (M1 has none to skip).
-  //   M2-003: 24h retention deadline metadata on trash-subtree entry.
-  //   M2-004: `--wipe` immediate trash-unlink + best-effort byte
-  //           overwrite where the underlying device supports it.
-  //   M3-001..004: RemoveRecord[] emission + audit + undo + elevate.
+  // Register plan (1-push prologue for target-preservation + rsp align):
+  //   rbx = target_ptr  (preserved across every nested Print call)
+  //   rdx = NUL-walk cursor (in the target-length compute)
+  //   rax = byte-load / flag-load / syscall-return scratch
+  //   rdi = print_str arg 1 (buffer pointer)
+  //   rsi = print_str arg 2 (length)
+  //   r11 = lea scratch (for .rodata strings and RmFlags .bss)
   //
-  // Leaf at M1-002; sysreg effect is declared for symmetry with the
-  // M1-003 upgrade (which syscalls into Print::print_str).
+  // Prologue: push rbx (rsp%16: 8 → 0). Epilogue: pop rbx, load
+  // rax = 0, ret (restores rsp%16 to 8 for the caller).
   // ============================================================================
   pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M1-002 rm_remove_body SKELETON. Returns 0 (EXIT_OK) immediately so the M1-002 argv-surface chain (RmMain → parse → scan → dispatch → this) walks end-to-end and exits cleanly. The rdi argument is untouched at M1-002; the M1-003 upgrade reads it as the target path. The signature is frozen: sysreg effect declared now so the M1-003 body edit that adds Print::print_str calls does not need a signature bump. Leaf function at M1-002 — no push/pop parity; the M1-003 upgrade adds one push (rbx) to preserve target_ptr across the nested syscalls.",
+      justification: "rm.M1-003 rm_remove_body first-runnable body. Reads flag_v + flag_dry_run from the RmFlags .bss slots, walks the target string to compute its length, emits the four-part placeholder line via Print::print_str: (optional 'rm: ') + (optional 'would remove: ' | default '') + <target> + ('\\n' | M1_STUB_SUFFIX). No filesystem side effects; the R48-close substrate is query-only on KIND_PDXFS_FILE and KIND_PDXFS_TXN (see design/architecture.md §6 for the substrate note). 1-push prologue (rbx) preserves target_ptr across up-to-four nested syscalls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte char codes. Every .bss / .rodata access is via lea r11, [rip + sym]. Return: pop rbx, xor rax,rax, ret — the exit code is always 0 at M1-003.",
       block: {
-        xor rax, rax;                        // EXIT_OK
+        // Prologue: preserve target_ptr across the four possible
+        // Print::print_str calls.
+        push rbx;                              // rsp%16: 8 → 0
+        mov rbx, rdi;                          // rbx = target_ptr
+
+        // ---- Part 1: optional "rm: " prefix (flag_v == 1) ---------------
+        lea r11, [rip + RmFlags::flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_remove_skip_verbose;
+
+        lea rdi, [rip + VERBOSE_PREFIX];
+        mov rsi, 4;                            // VERBOSE_PREFIX_LEN
+        call Print::print_str;
+
+      rm_remove_skip_verbose:
+        // ---- Part 2: conditional "would remove: " (flag_dry_run == 1) ---
+        lea r11, [rip + RmFlags::flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_remove_skip_dry_prefix;
+
+        lea rdi, [rip + DRY_RUN_PREFIX];
+        mov rsi, 14;                           // DRY_RUN_PREFIX_LEN
+        call Print::print_str;
+
+      rm_remove_skip_dry_prefix:
+        // ---- Part 3: print the target string ----------------------------
+        // Walk from rbx to the first NUL to compute the target length.
+        // rdx = walk cursor; length = rdx - rbx after the walk.
+        mov rdx, rbx;
+
+      rm_remove_walk_target:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je rm_remove_walk_done;
+        add rdx, 1;
+        jmp rm_remove_walk_target;
+
+      rm_remove_walk_done:
+        // Print the target: rdi = rbx (buffer), rsi = rdx - rbx (length).
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call Print::print_str;
+
+        // ---- Part 4: trailing suffix (dry-run → '\n'; else → M1 stub) ---
+        lea r11, [rip + RmFlags::flag_dry_run];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_remove_print_m1_suffix;
+
+        // Dry-run: just a newline.
+        lea rdi, [rip + NEWLINE];
+        mov rsi, 1;                            // NEWLINE_LEN
+        call Print::print_str;
+        jmp rm_remove_done_ok;
+
+      rm_remove_print_m1_suffix:
+        lea rdi, [rip + M1_STUB_SUFFIX];
+        mov rsi, 51;                           // M1_STUB_SUFFIX_LEN
+        call Print::print_str;
+        // fallthrough
+
+      rm_remove_done_ok:
+        // Epilogue: restore rbx, load exit code 0.
+        pop rbx;
+        xor rax, rax;                          // EXIT_OK
         ret
       }
     }
