@@ -1,0 +1,80 @@
+# .release/mirror.pdxmeta — rm 1.0.0 mirror-push metadata
+#
+# Consumed by `pkg push` (pkg.M4 subcommand) to land pkg.tar into a
+# package repository per design/tooling/plan.md §6.3. The default
+# target is pkgs.paideia-os/main/; the file lists staging + main so
+# the signing bot (T-INFRA-002) can promote after re-sign without
+# needing tool-side knowledge of the promotion path.
+#
+# Fields:
+#   name            Repo + package name (matches manifest.pdxproj).
+#   version         Semver (matches manifest.pdxproj + git tag).
+#   author          Author key label (matches manifest.pdxsig
+#                   [sig.author].key_id).
+#   target_repo     Base URL of the destination package repository.
+#   staging_path    Where `pkg push` uploads. Bot reads from here.
+#   main_path       Where the bot moves the tarball after re-sign.
+#   tar_layout      Files packed into pkg.tar (§6.4). The order is
+#                   canonical so the tarball hash is deterministic.
+#   verify_by       How `pkg install` verifies the download.
+#   deps            Runtime library deps (semver ranges). Match
+#                   manifest.pdxproj `deps:` block.
+#   post_install    Symlink placement (§6.4 `/bin/` layout).
+
+[package]
+name          = rm
+version       = 1.0.0
+author        = paideia-os-team
+license       = MIT
+
+[repo]
+target_repo   = https://pkgs.paideia-os/main/
+staging_path  = staging/rm/1.0.0/
+main_path     = main/rm/1.0.0/
+index_line    = rm 1.0.0 <hash>              # inserted into index.pdxsig on promote
+
+[tar]
+# Canonical file order for the pkg.tar assembly step. Deterministic
+# ordering keeps the tarball hash reproducible across build hosts.
+tar_layout    = bin/rm,
+                lib/,
+                doc/rm.pdxdoc,
+                caps.decl,
+                manifest.pdxsig,
+                CHANGELOG.md
+tar_hash_algo = blake3-256
+
+[verify]
+# pkg install fetches manifest.pdxsig first, verifies BOTH signatures,
+# then fetches pkg.tar and compares its BLAKE3 hash to the value
+# committed inside the signed manifest tuple. A pkg.tar that verifies
+# by only one signature is refused unless `pkg install --from-source`
+# is invoked (D4 trust-zero path).
+verify_by     = manifest.pdxsig[sig.author] + manifest.pdxsig[sig.paideia_root]
+verify_hash   = manifest.pdxsig[hash].value
+
+[deps]
+libpdx-argv          = ^0.1
+libpdx-semantic-pipe = ^0.2
+libpdx-audit         = ^0.2
+libpdx-elevate       = ^0.1
+
+[post_install]
+# `pkg install rm` places the built binary at /pkgs/rm-1.0.0/bin/rm
+# and symlinks /bin/rm -> /pkgs/rm-1.0.0/bin/rm (§6.4). The .pdxdoc
+# lands under /pkgs/rm-1.0.0/doc/ where `doc rm` reads it via the
+# `/system/doc/` mount (populated by pkg's post-install hook).
+install_root  = /pkgs/rm-1.0.0/
+bin_symlink   = /bin/rm -> /pkgs/rm-1.0.0/bin/rm
+doc_link      = /system/doc/rm.pdxdoc -> /pkgs/rm-1.0.0/doc/rm.pdxdoc
+journal_line  = pkg install rm 1.0.0 <hash>  # emitted to /journal/pkg/
+
+[status]
+# M5-002 landing state. The mirror-push infrastructure documented here
+# is design-final; the network path stands up when T-INFRA-001 lands.
+# Until then, `pkg push` is a shape-only invocation that writes into
+# a local staging directory and prints the URL that would receive the
+# tarball. The metadata block below is what the bot will read.
+push_supported     = local-staging   # → network when T-INFRA-001 lands
+bot_signature_step = pending         # → automatic when T-INFRA-002 lands
+release_state      = author-signed-only

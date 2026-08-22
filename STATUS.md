@@ -1,7 +1,9 @@
 # rm — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M4 (tests + smoke) — complete
+**Current milestone:** M5 (signed 1.0.0 release) — complete
+**Version:** 1.0.0 (author-signed; awaits paideia_root_pk re-sign
+              once T-INFRA-001/002 stand up the signing bot host)
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
 breakdown.
@@ -158,6 +160,45 @@ breakdown.
 | M4-002 (#13) | undo within retention window succeeds                              | LANDED |
 | M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | LANDED |
 | M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | LANDED |
+| M5-001 (#16) | dual-signed release + .pdxdoc + remove_reset gap close             | LANDED |
+| M5-002 (#17) | mirror push (.release/mirror.pdxmeta + procedure doc)              | LANDED |
+
+## M5 — 1.0 signed release (complete)
+
+- `src/remove.pdx` + `manifest.pdxproj` + `doc/rm.pdxdoc` +
+  `CHANGELOG.md` + `manifest.pdxsig` (issue #16, M5-001): dual-signed
+  1.0.0 release scaffold. `manifest.pdxproj` bumped to `version =
+  1.0.0` with the four release-time directives (`pdxdoc`,
+  `manifest_sig`, `changelog`, `mirror_meta`). `doc/rm.pdxdoc` is the
+  `doc rm` back-end per I7 §2 (@name / @synopsis / @description /
+  @options / @differences-from-posix / @exit-codes / @see /
+  @examples / @ergonomics / @since). `CHANGELOG.md` opens the 1.0.0
+  entry chronicling M1-M5 landings and enumerating the three
+  substrate gaps that carry forward (PdxFS mutating ops,
+  sys_pdxfs_undo_append, signing bot host). `manifest.pdxsig` reserves
+  the full 6714-byte dual-sig footprint (author + paideia_root, both
+  ML-DSA-65, 3309 bytes each; 32-byte BLAKE3 canonical-tuple hash;
+  padded placeholders so the file size does not shift when the bot
+  re-signs). `RmRemove::remove_reset` widened to also zero the four
+  slots M4-001 flagged (RmRetention::retention_attach_count,
+  RmRetention::retention_deadline_ns, RmWalk::walk_invocations,
+  RmWalk::walk_blocked_by_elevate) — closes the umbrella-reset gap
+  documented at tests/m4_001_txn_abort.pdx L57-64 and
+  src/walk.pdx L98-105.
+- `.release/mirror.pdxmeta` + `.release/README.md` (issue #17,
+  M5-002): mirror-push metadata + procedure doc. `mirror.pdxmeta`
+  encodes the pkg-push contract (name, version, author key label,
+  target repo / staging / main paths, canonical tar layout,
+  verification policy, runtime deps, post-install symlink layout).
+  Canonical `tar_layout` order (`bin/rm`, `lib/`, `doc/rm.pdxdoc`,
+  `caps.decl`, `manifest.pdxsig`, `CHANGELOG.md`) keeps the
+  tarball hash reproducible from a fresh source tree at the tagged
+  commit. `.release/README.md` documents the five-step release
+  flow (tag → author-sign → push staging → bot re-sign → pkg
+  upgrade) per design/tooling/plan.md §9.3 and names the substrate
+  gap that keeps the release `author-signed-only` until
+  T-INFRA-001/002 land. STATUS.md rolls up to LANDED for both M5
+  issues; the git tag `v1.0.0` marks the release commit.
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 
