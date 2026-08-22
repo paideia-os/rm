@@ -1,0 +1,274 @@
+// src/elevate.pdx -- rm.M3-004
+// RmElevate module: libpdx-elevate wire-up for /system/ + cross-subtree
+// targets.
+//
+// Scope
+// -----
+// This module implements the M3-004 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M3-004 line): "libpdx-elevate for /system/ +
+// cross-subtree targets". Ambient rm authority (per caps.decl) covers
+// KIND_PDXFS_FILE(write, <target-parent>) narrowed at exec to the
+// invoker's home subtree. Targets outside that scope — anything under
+// /system/, and (post-substrate) anything crossing the invoker's home
+// subtree boundary — require a per-operation elevate hop via the
+// R48.M7 elevate protocol.
+//
+// The M3-004 detector at start-of-remove:
+//   * scans the target path bytes for a "/system/" prefix (byte-by-
+//     byte compare via the paideia-as #1248 mitigation);
+//   * on prefix match, calls ElevateClient::elevate_client_request
+//     with (caps = 0, dur = 0, req_buf = &_elevate_req_buf,
+//     reply_buf = &_elevate_reply_buf);
+//   * on ELVC_STUB (0xFFFFEA00 = the M1 broker's happy path) or
+//     ELVC_OK (0 = the M2+ approved path) returns 0 (proceed);
+//   * on any other return code returns 1 (blocked).
+//
+// The "cross-subtree" detector is scheduled at M4 alongside the
+// invoker's home-subtree resolver (KIND_USER.home_root cap-tail);
+// M3-004 lands only the /system/ detector. This mirrors mv.M3-004's
+// scheduling: the /system/ prefix is a compile-time constant, the
+// home-root is a runtime cap-tail read that needs the user substrate
+// M4 wire-up.
+//
+// Substrate-and-broker note
+// -------------------------
+// The svc.elevate-broker at HEAD is a SEAM STUB (R48b substrate-prep,
+// paideia-os #1627) that returns ELVB_DISPATCH_STUB for every wire
+// op. ElevateClient::elevate_client_request at libpdx-elevate.M1
+// stops one step short of the endpoint invoke and returns ELVC_STUB
+// (0xFFFFEA00) on the happy path. RmElevate treats ELVC_STUB as
+// "elevate would be requested; substrate stub → proceed"; the M3 →
+// substrate transition strengthens this to "elevate requires a live
+// human APR → block until reply". Same "faithfully emit shape without
+// inventing outcome" discipline the M2 skeleton observes.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmElevate (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF. ELVC_STUB (0xFFFFEA00 =
+//     4294961152) fits imm32 (< 0x7FFFFFFF requires check: 0xFFFFEA00
+//     = 4294961152 > 0x7FFFFFFF = 2147483647 — so ELVC_STUB is staged
+//     in r11 via mov r11, imm64 before the compare, per the paideia-
+//     as r11 imm64 sweep discipline).
+//   - r11 is scratch (used for every lea AND for the ELVC_STUB imm64
+//     stage; uses are sequential).
+//   - Byte reads via xor rax, rax; mov_b rax, [ptr] (the /system/
+//     prefix scan).
+//   - elevate_check_and_request prologue: 1-push (rbx) preserves
+//     target_ptr across the prefix scan and the nested
+//     elevate_client_request call. Entry rsp % 16 == 8; push brings
+//     it to 0.
+
+module RmElevate = structure {
+
+  // -- /system/ prefix pattern -------------------------------------------
+  //
+  // 8 bytes exactly: '/' 's' 'y' 's' 't' 'e' 'm' '/'. Any target whose
+  // first 8 bytes match this byte-for-byte requires an elevate hop.
+  //
+  // Note the trailing '/' is significant: a hypothetical "/systemic"
+  // path would NOT match because byte 7 is 'i' not '/'. This is the
+  // intended semantic — the /system/ subtree boundary is the '/'
+  // character, not a substring prefix.
+  pub let SYSTEM_PREFIX     : [u8; 8] = "/system/"
+  pub let SYSTEM_PREFIX_LEN : u64     = 8
+
+  // -- Result codes ------------------------------------------------------
+  //
+  // The return value of elevate_check_and_request is a proceed/blocked
+  // discriminant. 0 = proceed (either no elevate needed, or the
+  // elevate call returned an OK-shaped code); 1 = blocked (elevate
+  // required but the call refused). Consumers dispatch on this.
+  pub let RE_PROCEED : u64 = 0
+  pub let RE_BLOCKED : u64 = 1
+
+  // Mirrored from libpdx-elevate/src/elevate_client.pdx (ELVC_STUB +
+  // ELVC_OK). Duplicated here so this module compiles standalone; the
+  // shared-lib promotion is a §5 wave concern (see plan doc §5.14
+  // libpdx-elevate M3).
+  pub let ELVC_OK   : u64 = 0
+  pub let ELVC_STUB : u64 = 0xFFFFEA00
+
+  // -- .bss scratch buffers + observability slots -----------------------
+  //
+  // The M1 ElevateClient::elevate_client_request writes an ELV REQ
+  // frame into req_buf. At HEAD the REQ frame size is bounded by
+  // ELV_REQ_FRAME_BYTES (typically ≤ 256B per the R48.M7 elevate_
+  // channel wire); a 256-byte buffer (32 u64 lanes) is more than
+  // enough for both req_buf and reply_buf.
+  //
+  // elevate_scanned_count       — number of elevate_check_and_request
+  //                                calls. Equals removed_count (every
+  //                                target scan increments).
+  // elevate_needed_count        — number of /system/-prefix matches.
+  // elevate_ok_count            — successful elevate calls
+  //                                (ELVC_STUB or ELVC_OK).
+  // elevate_err_count           — refused elevate calls (any other rc).
+  // elevate_last_ret            — most recent elevate_client_request
+  //                                return code (M4 inspects to
+  //                                distinguish ELVC_STUB from ELVC_OK).
+  pub let mut _elevate_req_buf     : [u64; 32] = uninit @align(8)
+  pub let mut _elevate_reply_buf   : [u64; 32] = uninit @align(8)
+  pub let mut elevate_scanned_count : u64      = uninit @align(8)
+  pub let mut elevate_needed_count  : u64      = uninit @align(8)
+  pub let mut elevate_ok_count      : u64      = uninit @align(8)
+  pub let mut elevate_err_count     : u64      = uninit @align(8)
+  pub let mut elevate_last_ret      : u64      = uninit @align(8)
+
+  // ============================================================================
+  // elevate_reset()
+  //
+  // Signature: elevate_reset : () -> () !{mem} @{}
+  //
+  // Zero the five observability slots. Called from
+  // RmRemove::remove_reset. Leaf.
+  // ============================================================================
+  pub let elevate_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-004 elevate_reset. Zero the five observability slots (elevate_scanned_count, elevate_needed_count, elevate_ok_count, elevate_err_count, elevate_last_ret) so a fresh rm_main invocation starts baseline. Scratch buffers _elevate_req_buf and _elevate_reply_buf not scrubbed — ElevateClient::elevate_client_request overwrites _elevate_req_buf on every call and never reads _elevate_reply_buf at M1 (block-on-recv is M2+). xor rax,rax produces the zero constant; five lea+mov pairs write it. r11 scratch. Leaf function; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + elevate_scanned_count]; mov [r11], rax;
+        lea r11, [rip + elevate_needed_count];  mov [r11], rax;
+        lea r11, [rip + elevate_ok_count];      mov [r11], rax;
+        lea r11, [rip + elevate_err_count];     mov [r11], rax;
+        lea r11, [rip + elevate_last_ret];      mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // elevate_check_and_request(target_ptr) -> u64
+  //
+  // Signature: elevate_check_and_request : (u64) -> u64 !{mem} @{}
+  // RDI (input):  target_ptr — NUL-terminated path pointer
+  // RAX (output): RE_PROCEED (0) — no elevate needed, or elevate OK
+  //               RE_BLOCKED (1) — elevate needed and refused
+  //
+  // Body:
+  //   (1) Bump elevate_scanned_count.
+  //   (2) Byte-by-byte compare target_ptr[0..8] against SYSTEM_PREFIX.
+  //         On any mismatch (or short target — NUL before byte 8),
+  //         return RE_PROCEED without an elevate call.
+  //   (3) On full 8-byte match: bump elevate_needed_count and call
+  //         ElevateClient::elevate_client_request(caps=0, dur=0,
+  //           req_buf=&_elevate_req_buf, reply_buf=&_elevate_reply_buf).
+  //   (4) Snapshot the return into elevate_last_ret; classify:
+  //         rax == ELVC_OK   (0)            → bump ok_count, RE_PROCEED
+  //         rax == ELVC_STUB (0xFFFFEA00)   → bump ok_count, RE_PROCEED
+  //         otherwise                        → bump err_count, RE_BLOCKED
+  //
+  // Register plan (1-push + no pad; 1 nested call at aligned rsp):
+  //   rbx = target_ptr    (preserved across the scan + elevate call)
+  //   rcx = prefix scan index (0..8)
+  //   rax = byte load / elevate return / counter scratch
+  //   r11 = lea scratch (SYSTEM_PREFIX + .bss slots + ELVC_STUB imm64)
+  //
+  // Entry rsp % 16 == 8 → push rbx → rsp % 16 == 0 for the nested
+  // elevate_client_request call. ELVC_STUB exceeds imm32 and is
+  // staged in r10 via mov r10, imm64 before the compare (r11 is being
+  // used for the .bss slot access at that point; r10 is caller-save
+  // and free).
+  //
+  // Byte-load discipline (#1248 mitigation): xor rax, rax; mov_b rax,
+  // [rbx + rcx]. Prefix byte compares in cmp rax, imm8 form.
+  // ============================================================================
+  pub let elevate_check_and_request : (u64) -> u64 !{mem} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-004 elevate_check_and_request. Byte-by-byte prefix compare target_ptr[0..8] against SYSTEM_PREFIX '/system/'; on match dispatch ElevateClient::elevate_client_request with the two scratch buffers as REQ / reply carriers. 1-push prologue (rbx=target_ptr) preserves target across the 8-byte scan and the nested elevate_client_request call, and keeps rsp%16 == 0 for the call. Byte loads use the #1248 mitigation (xor rax,rax; mov_b rax,[ptr]). Prefix bytes are all ≤ 0x7F so cmp reg,imm8 forms are safe. Loop counter compared against 8 (SYSTEM_PREFIX_LEN, imm8-safe). ELVC_STUB (0xFFFFEA00) exceeds imm32's 0x7FFFFFFF window so it is staged in r10 via mov r10, imm64 for the compare (paideia-as r11 imm64 sweep pattern; r10 chosen over r11 because r11 is holding the .bss lea base at that point). All other immediates ≤ 8 fit imm8. Classification: ELVC_OK (0) or ELVC_STUB (0xFFFFEA00) → RE_PROCEED + ok_count bump; any other rc → RE_BLOCKED + err_count bump. Return: pop rbx, ret with rax carrying the discriminant. r11 uses: SYSTEM_PREFIX lea, .bss slot leas, sequential; never overlaps with the r10 imm64 stage.",
+      block: {
+        push rbx;                              // rsp%16: 8 → 0
+        mov rbx, rdi;                          // rbx = target_ptr
+
+        // (1) Bump elevate_scanned_count.
+        lea r11, [rip + elevate_scanned_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // (2) Byte-by-byte prefix scan. rcx = i; loop 0..8.
+        xor rcx, rcx;
+
+      re_scan_head:
+        cmp rcx, 8;                            // SYSTEM_PREFIX_LEN
+        jae re_scan_matched;
+
+        // Load target byte via #1248 mitigation.
+        mov r8, rbx;
+        add r8, rcx;
+        xor rax, rax;
+        mov_b rax, [r8];
+
+        // Short target: NUL before we cover all 8 prefix bytes → no match.
+        cmp rax, 0;
+        je re_no_elevate;
+
+        // Load prefix byte via lea into SYSTEM_PREFIX.
+        lea r11, [rip + SYSTEM_PREFIX];
+        add r11, rcx;
+        xor r9, r9;
+        mov_b r9, [r11];
+
+        cmp rax, r9;
+        jne re_no_elevate;
+
+        add rcx, 1;
+        jmp re_scan_head;
+
+      re_scan_matched:
+        // (3) /system/ prefix confirmed. Bump needed, request elevate.
+        lea r11, [rip + elevate_needed_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ElevateClient::elevate_client_request(caps=0, dur=0,
+        //   req_buf=&_elevate_req_buf, reply_buf=&_elevate_reply_buf).
+        xor rdi, rdi;                          // caps = 0
+        xor rsi, rsi;                          // dur = 0
+        lea rdx, [rip + _elevate_req_buf];     // req_buf
+        lea rcx, [rip + _elevate_reply_buf];   // reply_buf
+        call ElevateClient::elevate_client_request;
+
+        // Snapshot return, classify.
+        lea r11, [rip + elevate_last_ret];
+        mov [r11], rax;
+
+        // ELVC_OK (0) → PROCEED. Check first, fast path.
+        cmp rax, 0;
+        je re_ok;
+
+        // ELVC_STUB (0xFFFFEA00, exceeds imm32) → PROCEED. Stage in r10.
+        mov r10, 0xFFFFEA00;                   // ELVC_STUB
+        cmp rax, r10;
+        je re_ok;
+
+        // Any other rc → BLOCKED.
+        lea r11, [rip + elevate_err_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        mov rax, 1;                            // RE_BLOCKED
+        pop rbx;
+        ret
+
+      re_ok:
+        lea r11, [rip + elevate_ok_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        xor rax, rax;                          // RE_PROCEED
+        pop rbx;
+        ret
+
+      re_no_elevate:
+        // No /system/ prefix — proceed without elevate.
+        xor rax, rax;                          // RE_PROCEED
+        pop rbx;
+        ret
+      }
+    }
+}

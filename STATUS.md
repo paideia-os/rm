@@ -1,7 +1,7 @@
 # rm — status
 
 **Wave:** R50 (Wave 2)
-**Current milestone:** M2 (core implementation) — complete
+**Current milestone:** M3 (audit + undo + elevate) — complete
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
 breakdown.
@@ -17,7 +17,7 @@ breakdown.
   — single-file remove via trash-subtree move skeleton (returns
   `EXIT_OK` with a placeholder line naming the target).
 
-## M2 — core implementation (in progress)
+## M2 — core implementation (complete)
 
 - `src/walk.pdx` + `src/remove.pdx` extend (issue #4, M2-001):
   recursive `-r` leaf-first walk under a single TXN. `rm_remove_body`
@@ -46,17 +46,60 @@ breakdown.
   `flag_wipe == 1 && flag_dry_run == 0` — skips both retention and
   M2 stub suffix. `remove_reset` zeros both new slots.
 
+## M3 — audit + undo + elevate (complete)
+
+- `src/schema.pdx` + `src/main.pdx` + `src/remove.pdx` extend
+  (issue #8, M3-001): RemoveRecord@0.1 = 5 lanes (target_ptr,
+  target_len, size=0-M3, was_dir=0-M3, trash_handle=0-M3). New
+  `RmSchema::schema_bind_stdout` binds fd 1 at start-of-run;
+  `RmSchema::record_emit` composes into `_record_scratch` +
+  `Send::send_record`. `rm_process_one` hoists `target_len` NUL-walk
+  into r12; emits records in --wipe and default branches (dry-run
+  skips, by design). `remove_reset` delegates `schema_reset`.
+- `src/audit.pdx` + `src/main.pdx` + `src/remove.pdx` extend
+  (issue #9, M3-002): D3 audit-first envelope via three
+  `AuditClient` calls. `audit_pre(op_args=0)` hoisted to top of
+  `rm_main` so `audit_id_slot` survives `remove_reset`;
+  `audit_record_target(target_ptr)` per successful removal
+  (`output_schema=RemoveRecord@0.1`, `output_hash=target_ptr` M3
+  stub); `audit_post(exit_code)` commits at epilogue with exit
+  preserved via r12. Failure is observability-only at M3 (exit-3
+  gate lands with M4 smoke harness).
+- `src/undo.pdx` + `src/remove.pdx` extend (issue #10, M3-003):
+  6-lane PdxFS v1 undo record ([UNDO_OP_RM, target_ptr, target_len,
+  trash_handle, retention_deadline_ns, was_dir]) composed into
+  `_undo_scratch`. `undo_write` runs AFTER `retention_attach` (so
+  the snapshot is populated) and BEFORE `record_emit`. --wipe
+  explicitly skips undo (no trash entry, no reversal — forensic-
+  detection invariant §3.1). No syscall at M3; substrate transition
+  edits the body to `sys_pdxfs_undo_append` at the same call site.
+- `src/elevate.pdx` + `src/remove.pdx` + `src/walk.pdx` extend
+  (issue #11, M3-004): 8-byte "/system/" prefix scan on target;
+  on match dispatches `ElevateClient::elevate_client_request` with
+  `_elevate_req_buf` + `_elevate_reply_buf`. ELVC_STUB (0xFFFFEA00,
+  staged via `mov r10, imm64` per imm64 sweep) and ELVC_OK both
+  proceed; any other rc blocks the removal (bumps
+  `rm_blocked_by_elevate`, EXIT_OK preserved at M3). Runs FIRST in
+  `rm_process_one` — no observable action if refused.
+  `walk_blocked_by_elevate` counter added for the walk-branch
+  top-level target (walk-per-entry hook lands with the substrate
+  transition).
+
 ## Milestone rollup
 
-| ID          | Title                                                              | State  |
-|-------------|--------------------------------------------------------------------|--------|
-| M1-001 (#1) | scaffold + caps.decl (target-parent write + TXN)                   | LANDED |
-| M1-002 (#2) | argv surface via libpdx-argv (rm [-r|-f|-v|--wipe|--dry-run])      | LANDED |
-| M1-003 (#3) | first runnable: single-file remove via trash-subtree move          | LANDED |
-| M2-001 (#4) | recursive -r leaf-first walk under single TXN (skeleton)           | LANDED |
-| M2-002 (#5) | -f force flag (skip per-file confirmation)                         | LANDED |
-| M2-003 (#6) | 24h retention deadline metadata on trash-subtree entry             | LANDED |
-| M2-004 (#7) | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | LANDED |
+| ID           | Title                                                              | State  |
+|--------------|--------------------------------------------------------------------|--------|
+| M1-001 (#1)  | scaffold + caps.decl (target-parent write + TXN)                   | LANDED |
+| M1-002 (#2)  | argv surface via libpdx-argv (rm [-r|-f|-v|--wipe|--dry-run])      | LANDED |
+| M1-003 (#3)  | first runnable: single-file remove via trash-subtree move          | LANDED |
+| M2-001 (#4)  | recursive -r leaf-first walk under single TXN (skeleton)           | LANDED |
+| M2-002 (#5)  | -f force flag (skip per-file confirmation)                         | LANDED |
+| M2-003 (#6)  | 24h retention deadline metadata on trash-subtree entry             | LANDED |
+| M2-004 (#7)  | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | LANDED |
+| M3-001 (#8)  | RemoveRecord[] schema bind (path, size, was_dir, trash_handle)     | LANDED |
+| M3-002 (#9)  | RemoveRecord via libpdx-audit before trash-move                    | LANDED |
+| M3-003 (#10) | PdxFS v1 undo record (replay reconstructs from trash)              | LANDED |
+| M3-004 (#11) | libpdx-elevate for /system/ + cross-subtree targets                | LANDED |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

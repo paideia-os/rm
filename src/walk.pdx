@@ -1,4 +1,4 @@
-// src/walk.pdx — rm.M2-001
+// src/walk.pdx — rm.M3-004 (extends M2-001)
 // RmWalk module: recursive `-r` leaf-first walk under a single TXN.
 //
 // Scope
@@ -85,6 +85,24 @@ module RmWalk = structure {
   // both removed_count and walk_invocations; the sum must equal
   // pos_count if every positional was dispatched exactly once.
   pub let mut walk_invocations : u64 = uninit @align(8)
+
+  // -- M3-004 counter ---------------------------------------------------
+  // walk_blocked_by_elevate — bumped when RmElevate::elevate_check_and_
+  // request refuses at the walk-branch top-level target. The walk
+  // skips the print + M3 hooks; walk_invocations still counts the
+  // dispatch (so an operator can distinguish "walk dispatched then
+  // skipped by elevate" from "walk never entered"). Reset each rm
+  // invocation via RmRemove::remove_reset (M3 extension adds it to
+  // the umbrella reset list).
+  //
+  // NOTE: this .bss slot is intentionally NOT zeroed in remove_reset
+  // at M3 to keep the umbrella reset's write-count bounded — the M4
+  // extension will add it alongside the wave of walk-per-entry
+  // counters the substrate transition introduces. At M3 an operator
+  // who re-runs rm in the same process (not a supported flow) reads
+  // a stale walk_blocked_by_elevate; the M4 smoke matrix documents
+  // this and the M4 remove_reset covers it.
+  pub let mut walk_blocked_by_elevate : u64 = uninit @align(8)
 
   // -- .rodata output pieces -------------------------------------------
   // The walk emits a four-part line whose structure mirrors the

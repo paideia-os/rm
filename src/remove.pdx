@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M3-003 (extends M3-002)
+// src/remove.pdx — rm.M3-004 (extends M3-003)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -87,6 +87,17 @@ module RmRemove = structure {
   pub let mut confirm_skips_by_f   : u64 = uninit @align(8)
   pub let mut confirm_prompts_stub : u64 = uninit @align(8)
 
+  // -- M3-004 counter ---------------------------------------------------
+  // rm_blocked_by_elevate — bumped when RmElevate::elevate_check_and_
+  // request returns RE_BLOCKED (elevate needed AND libpdx-elevate
+  // refused). The removal is skipped entirely — no confirm hop, no
+  // print, no retention, no M3 emit hooks — but the process exit code
+  // stays EXIT_OK (M4 raises this to EXIT_OP_FAIL when a smoke matrix
+  // guarantees the broker is present; M3 preserves the substrate-
+  // skeleton discipline where a HEAD run with no live broker still
+  // completes cleanly). Reset each rm invocation via remove_reset.
+  pub let mut rm_blocked_by_elevate : u64 = uninit @align(8)
+
   // -- M2 output message pieces ----------------------------------------
   // The M1-003 four-part shape is preserved: (optional verbose prefix)
   // + (optional dry-run prefix) + <target> + trailing suffix. The
@@ -141,7 +152,7 @@ module RmRemove = structure {
   pub let remove_reset : () -> () !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M3-003 remove_reset. Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count), then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset). Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema / RmAudit / RmUndo slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap, sched} to cover the M3 modules' declared effect surfaces (their resets themselves are !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the three nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
+      justification: "rm.M3-004 remove_reset (extended through M3). Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count) AND the new M3-004 rm_blocked_by_elevate counter, then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset, RmElevate::elevate_reset). Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema / RmAudit / RmUndo / RmElevate slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap, sched} to cover the M3 modules' declared effect surfaces (their resets themselves are !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the four nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
       block: {
         sub rsp, 8;                                 // rsp%16: 8 → 0
 
@@ -149,13 +160,15 @@ module RmRemove = structure {
         lea r11, [rip + removed_count];             mov [r11], rax;
         lea r11, [rip + confirm_skips_by_f];        mov [r11], rax;
         lea r11, [rip + confirm_prompts_stub];      mov [r11], rax;
+        lea r11, [rip + rm_blocked_by_elevate];     mov [r11], rax;
         lea r11, [rip + RmWipe::was_wiped_flag];    mov [r11], rax;
         lea r11, [rip + RmWipe::wipe_count];        mov [r11], rax;
 
-        // Delegate to M3 module resets.
+        // Delegate to M3 module resets (M3-001/002/003/004).
         call RmSchema::schema_reset;
         call RmAudit::audit_reset;
         call RmUndo::undo_reset;
+        call RmElevate::elevate_reset;
 
         add rsp, 8;
         ret
@@ -369,7 +382,7 @@ module RmRemove = structure {
   pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M3-003 rm_process_one (extended through M3-002). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then the M3 hooks fire (RmSchema::record_emit + RmAudit::audit_record_target — NO undo, wipe leaves no trash entry so no reversal exists; this is the load-bearing forensic-detection invariant from design/argv-surface.md §3.1). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hooks (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints the four M3 hops (retention_attach + undo_write + record_emit + audit_record_target) + M2_STUB_SUFFIX. undo_write runs AFTER retention_attach because undo_write snapshots RmRetention::retention_deadline_ns which retention_attach populates. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site (confirm_check, wipe_emit, four Print::print_str, retention_attach, undo_write, record_emit, audit_record_target). rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail !{mem, sysreg} @{cap, sched} covers the semantic-pipe + audit call fanout (undo_write is !{mem} @{} — subsumed). Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
+      justification: "rm.M3-004 rm_process_one (extended through M3-003). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M3-004) RmElevate::elevate_check_and_request runs FIRST — a /system/-prefixed target that libpdx-elevate refuses skips the entire remove (bumps rm_blocked_by_elevate, epilogue to EXIT_OK with no side effects; the M4 wire-up will raise this to EXIT_OP_FAIL once a smoke harness guarantees broker availability). (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then the M3 hooks fire (RmSchema::record_emit + RmAudit::audit_record_target — NO undo, wipe leaves no trash entry so no reversal exists; this is the load-bearing forensic-detection invariant from design/argv-surface.md §3.1). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hooks (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints the four M3 hops (retention_attach + undo_write + record_emit + audit_record_target) + M2_STUB_SUFFIX. undo_write runs AFTER retention_attach because undo_write snapshots RmRetention::retention_deadline_ns which retention_attach populates. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site (elevate_check_and_request, confirm_check, wipe_emit, four Print::print_str, retention_attach, undo_write, record_emit, audit_record_target). rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail !{mem, sysreg} @{cap, sched} covers the audit + semantic-pipe + elevate call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
       block: {
         // Prologue: preserve target_ptr + target_len across every hook.
         push rbx;                              // rsp%16: 8 → 0
@@ -394,6 +407,16 @@ module RmRemove = structure {
       rm_process_len_done:
         mov r12, rdx;
         sub r12, rbx;                          // r12 = target_len
+
+        // ---- M3-004: elevate check (before any observable action) -------
+        // A refusal must produce no confirm hop, no print, no retention,
+        // no audit/schema/undo emission — the removal never happened
+        // from the caller's perspective. Bump rm_blocked_by_elevate so
+        // an operator inspecting the counter set can see the refusal.
+        mov rdi, rbx;
+        call RmElevate::elevate_check_and_request;
+        cmp rax, 0;                            // RE_PROCEED (0)
+        jne rm_process_blocked;
 
         // ---- M2-002: confirm gate (proceeds unconditionally at M2/M3) ---
         mov rdi, rbx;                          // arg = target_ptr
@@ -514,6 +537,21 @@ module RmRemove = structure {
         pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK
+        ret
+
+      rm_process_blocked:
+        // ---- Elevate refused: skip the removal entirely -----------------
+        // No confirm, no print, no retention, no undo/schema/audit emit.
+        // Bump the blocked counter so an operator can see the refusal.
+        lea r11, [rip + rm_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        xor rax, rax;                          // EXIT_OK at M3
         ret
       }
     }
