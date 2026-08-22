@@ -1,0 +1,119 @@
+// src/remove.pdx — rm.M1-002 skeleton (upgraded at rm.M1-003)
+// RmRemove module: the rm removal body.
+//
+// Scope at M1-002 (this file)
+// ---------------------------
+// This is the SKELETON that lands with the argv surface. It exposes
+// the `rm_remove_body(target_ptr)` entry point so `RmMain::rm_main`
+// can wire the call site at parse-and-validate close. At M1-002 the
+// body is a no-op that returns `EXIT_OK` (0) — the binary walks the
+// full argv → parse → scan → dispatch chain and exits cleanly, but
+// no user-visible output is produced by this module.
+//
+// The M1-003 upgrade replaces this body with the first-runnable
+// placeholder: read the caller-supplied target pointer, honour
+// `--dry-run` and `-v`, print a single-line placeholder on stdout,
+// return `EXIT_OK`. The signature is frozen at M1-002 so the M1-003
+// upgrade is a body edit inside rm_remove_body and does NOT change
+// `RmMain::rm_main`.
+//
+// The `remove_reset()` companion clears a per-invocation counter
+// slot. At M1-002 the slot is unused; M2-001's leaf-first recursive
+// walk populates it with the number of files trashed so the M4
+// tests can assert the count without a downstream print. The slot
+// is introduced now so the M2 patch is a body edit inside
+// pkg_remove_body's loop, not a new .bss allocation.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmRemove (PascalCase basename).
+//   - No test mnemonic.
+//   - r11 is scratch.
+//   - Leaf functions at M1-002; the M1-003 upgrade takes one push
+//     (rbx) to preserve target_ptr across nested Print::print_str
+//     calls.
+
+module RmRemove = structure {
+
+  // -- Exit codes shared with RmMain -----------------------------------
+  // Consumer (dispatch table at RmMain) matches on:
+  //   0 EXIT_OK              — the operation succeeded
+  //   1 EXIT_OP_FAIL         — the operation failed (M2+ paths)
+  //   2 EXIT_USAGE           — argv-surface error (handled by RmMain)
+  //   3 EXIT_NOT_YET_IMPL    — recognised but not implemented at this M
+  //
+  // rm at M1 only ever returns 0 (the M1-003 placeholder always
+  // succeeds); the codes are declared here so downstream milestones
+  // return them from this same module.
+  pub let EXIT_OK             : u64 = 0
+  pub let EXIT_OP_FAIL        : u64 = 1
+  pub let EXIT_USAGE          : u64 = 2
+  pub let EXIT_NOT_YET_IMPL   : u64 = 3
+
+  // -- Per-invocation counter (populated at M2-001) --------------------
+  // Number of files trashed in the current rm_main call. M1-002 leaves
+  // this at zero; M1-003's placeholder body reads but does not write
+  // it. M2-001's recursive walk increments it per successful trash-
+  // move. M4's tests inspect this slot to assert the count matches
+  // the expected leaf-first traversal.
+  pub let mut removed_count : u64 = uninit @align(8)
+
+  // ============================================================================
+  // remove_reset()
+  //
+  // Signature: remove_reset : () -> () !{mem} @{}
+  //
+  // Clear removed_count. Called by RmMain::rm_main before
+  // rm_remove_body so a subsequent invocation starts from a known-
+  // zero baseline (relevant when the shell reuses one rm binary
+  // across multiple commands in a subshell).
+  //
+  // Leaf; r11 scratch; no callee-save touched.
+  // ============================================================================
+  pub let remove_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M1-002 remove_reset. Zero removed_count so rm_remove_body starts from a known baseline. Mirror of libpdx-argv ParsedArgs::reset shape. Leaf function; r11 scratch used only for the lea; xor rax,rax produces the zero constant.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + removed_count];
+        mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // rm_remove_body(target_ptr) -> exit_code
+  //
+  // Signature: rm_remove_body : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): target_ptr — VA of a NUL-terminated path (from
+  //                            ParsedArgs::pos_ptrs[0])
+  // RAX (output): 0 (EXIT_OK) at M1-002; upgraded at M1-003
+  //
+  // M1-002 body (this file): return 0 immediately. The M1-003 upgrade
+  // reads RmFlags::flag_v / flag_dry_run, selects one of three
+  // .rodata message templates, and prints "target: <path>\n" on
+  // stdout via Print::print_str. The signature and call site are
+  // frozen at M1-002.
+  //
+  // Downstream body upgrades (per §5.8 in the plan doc):
+  //   M2-001: recursive `-r` leaf-first walk under a single TXN.
+  //   M2-002: `-f` skip confirmation (M1 has none to skip).
+  //   M2-003: 24h retention deadline metadata on trash-subtree entry.
+  //   M2-004: `--wipe` immediate trash-unlink + best-effort byte
+  //           overwrite where the underlying device supports it.
+  //   M3-001..004: RemoveRecord[] emission + audit + undo + elevate.
+  //
+  // Leaf at M1-002; sysreg effect is declared for symmetry with the
+  // M1-003 upgrade (which syscalls into Print::print_str).
+  // ============================================================================
+  pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.M1-002 rm_remove_body SKELETON. Returns 0 (EXIT_OK) immediately so the M1-002 argv-surface chain (RmMain → parse → scan → dispatch → this) walks end-to-end and exits cleanly. The rdi argument is untouched at M1-002; the M1-003 upgrade reads it as the target path. The signature is frozen: sysreg effect declared now so the M1-003 body edit that adds Print::print_str calls does not need a signature bump. Leaf function at M1-002 — no push/pop parity; the M1-003 upgrade adds one push (rbx) to preserve target_ptr across the nested syscalls.",
+      block: {
+        xor rax, rax;                        // EXIT_OK
+        ret
+      }
+    }
+}

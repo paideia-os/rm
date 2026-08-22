@@ -1,0 +1,228 @@
+// src/flags.pdx — rm.M1-002
+// RmFlags module: walk ParsedArgs::flag_names[0..flag_count] and
+// project the five rm-recognised flags into five boolean .bss slots
+// the rest of rm reads directly.
+//
+// Scope
+// -----
+// The M1 argv surface accepts five flags — `-r`, `-f`, `-v`,
+// `--wipe`, `--dry-run` — per §5.8 of design/tooling/r49-r50-plan.md
+// in the paideia-os repo. libpdx-argv already parses them (short-
+// flag grammar at M1-002, long-flag grammar at M1-001) and stores
+// each recognised flag as a name-pointer + value-pointer pair in
+// ParsedArgs::flag_names[] + flag_values[]. This module reads those
+// arrays and sets one boolean slot per known flag.
+//
+// The five flags have distinct first bytes (r / f / v / w / d) so
+// the scanner uses a first-byte switch and a per-branch inline
+// byte-compare (same idiom as libpdx-argv's --pdx-schema well-known
+// check in src/parser.pdx). Unknown flags fall through silently at
+// M1 — the unknown-flag rejection contract is a body edit inside
+// this module scheduled for M4 (test invariant "unknown flag → exit
+// 2") and does not require a signature change on flags_scan.
+//
+// Every rm flag is boolean at M1 — the value-pointer is ignored
+// even when libpdx-argv's lookahead absorbed a positional as the
+// flag's value. Downstream milestones do NOT add value-taking flags
+// to rm (M2's `-r`, `--wipe`, `--dry-run` all stay boolean); the
+// argv surface is frozen at M1.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmFlags (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (all char codes ≤ 0x7F,
+//     flag_count bound is 32 which fits trivially).
+//   - r11 is scratch (used in every lea for the ParsedArgs .bss
+//     externals and this module's own .bss slots).
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per the #1248
+//     mitigation.
+//   - Leaf functions: no callee-save touched, no push/pop parity.
+
+module RmFlags = structure {
+
+  // ============================================================================
+  // Boolean flag slots. Each is u64-typed even though the value is
+  // always 0 or 1 — the extra width means the scanner can `mov [slot],
+  // rax` without a narrow-store mnemonic, and it matches the
+  // singleton .bss pattern from libpdx-argv (ParsedArgs::emit_schema).
+  //
+  // Consumer (RmRemove::rm_remove_body at M1, extended M2+) reads
+  // these directly by name.
+  // ============================================================================
+
+  // -r: recursive removal. M2-001 wires the leaf-first walk; M1's
+  // rm_remove_body prints an M1-stub message and returns EXIT_OK
+  // regardless of this flag (the body-edit lands the enforcement).
+  pub let mut flag_r       : u64 = uninit @align(8)
+
+  // -f: force (no per-file confirmation). M2-002 wires the confirm-
+  // skip. M1 has no confirmation prompt to skip.
+  pub let mut flag_f       : u64 = uninit @align(8)
+
+  // -v: verbose. M1 honours this by prepending "rm: " to the
+  // rm_remove_body placeholder line; downstream milestones prepend
+  // per-file "removing <path>" progress lines when set.
+  pub let mut flag_v       : u64 = uninit @align(8)
+
+  // --wipe: shred (immediate trash-unlink + byte overwrite). M2-004
+  // wires the shred body. M1 recognises the flag but produces the
+  // same placeholder output either way.
+  pub let mut flag_wipe    : u64 = uninit @align(8)
+
+  // --dry-run: print what would be removed but do not touch anything.
+  // M1 honours this by printing "would remove: <target>\n" on stdout
+  // instead of the M1-stub placeholder. M2+ bodies enforce the
+  // no-side-effect contract when this is set.
+  pub let mut flag_dry_run : u64 = uninit @align(8)
+
+  // ============================================================================
+  // flags_reset()
+  //
+  // Signature: flags_reset : () -> () !{mem} @{}
+  //
+  // Clear all five boolean slots so a subsequent flags_scan starts
+  // from a known-zero baseline. Mirror of ParsedArgs::reset shape
+  // (libpdx-argv). Called by RmMain::rm_main before flags_scan.
+  //
+  // Leaf; r11 scratch; no callee-save touched.
+  // ============================================================================
+  pub let flags_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M1-002 flags_reset. Zero the five boolean flag slots so a subsequent flags_scan starts clean. Mirror of libpdx-argv ParsedArgs::reset shape. xor rax,rax produces the zero constant; five lea+mov pairs write it to each slot. r11 is scratch (paideia-as conformance). Leaf function; no push/pop parity to preserve.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + flag_r];       mov [r11], rax;
+        lea r11, [rip + flag_f];       mov [r11], rax;
+        lea r11, [rip + flag_v];       mov [r11], rax;
+        lea r11, [rip + flag_wipe];    mov [r11], rax;
+        lea r11, [rip + flag_dry_run]; mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // flags_scan()
+  //
+  // Signature: flags_scan : () -> () !{mem} @{}
+  //
+  // Walk ParsedArgs::flag_names[0..flag_count]. For each name, do a
+  // first-byte switch on the byte at [name+0] and, on a match, verify
+  // the remaining bytes inline. On full match, write 1 to the matching
+  // boolean slot. Unknown flags fall through — at M1 they are
+  // silently ignored; the M4 rejection contract lands as a body edit
+  // that returns rax != 0 on the first unknown flag.
+  //
+  // Register plan (leaf; only reads ParsedArgs and writes own .bss):
+  //   r8  = i           (loop counter over flag_names[])
+  //   r9  = flag_count  (loaded once at loop entry)
+  //   rdx = name_ptr    (flag_names[i]; NUL-terminated)
+  //   rax = byte load scratch
+  //   r11 = lea scratch (every .bss access uses lea r11, [rip + sym])
+  //
+  // The name-pointer for each entry is INTERIOR into the process's
+  // argv strings (libpdx-argv's Parser::parse_argv keeps names as
+  // pointers into argv, NUL-terminating in place at '=' or advancing
+  // rdx past '-' / '--'). That means the bytes we compare below are
+  // in the shell-supplied argv buffer; the caller-owned invariant
+  // guarantees they are valid for read.
+  // ============================================================================
+  pub let flags_scan : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d' (distinct across the M1 vocabulary); per-branch inline byte-compare with #1248-mitigated byte loads. Unknown flags fall through silently at M1 (documented in design/argv-surface.md; enforcement lands at M4 as a body edit returning a u64 error code). All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
+      block: {
+        xor r8, r8;                              // i = 0
+        lea r11, [rip + ParsedArgs::flag_count];
+        mov r9, [r11];                           // r9 = flag_count
+
+      flags_scan_loop_head:
+        cmp r8, r9;
+        jge flags_scan_done;
+
+        lea r11, [rip + ParsedArgs::flag_names];
+        mov rdx, [r11 + r8*8];                   // rdx = flag_names[i]
+
+        // First-byte switch on the flag name.
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0x72;                           // 'r'
+        je flags_try_r;
+        cmp rax, 0x66;                           // 'f'
+        je flags_try_f;
+        cmp rax, 0x76;                           // 'v'
+        je flags_try_v;
+        cmp rax, 0x77;                           // 'w' (wipe)
+        je flags_try_wipe;
+        cmp rax, 0x64;                           // 'd' (dry-run)
+        je flags_try_dry_run;
+        jmp flags_advance;                       // unknown → silently ignored at M1
+
+      // ---- -r: NUL at [rdx+1] ----
+      flags_try_r:
+        xor rax, rax;
+        mov_b rax, [rdx + 1];
+        cmp rax, 0;
+        jne flags_advance;
+        mov rax, 1;
+        lea r11, [rip + flag_r];
+        mov [r11], rax;
+        jmp flags_advance;
+
+      // ---- -f: NUL at [rdx+1] ----
+      flags_try_f:
+        xor rax, rax;
+        mov_b rax, [rdx + 1];
+        cmp rax, 0;
+        jne flags_advance;
+        mov rax, 1;
+        lea r11, [rip + flag_f];
+        mov [r11], rax;
+        jmp flags_advance;
+
+      // ---- -v: NUL at [rdx+1] ----
+      flags_try_v:
+        xor rax, rax;
+        mov_b rax, [rdx + 1];
+        cmp rax, 0;
+        jne flags_advance;
+        mov rax, 1;
+        lea r11, [rip + flag_v];
+        mov [r11], rax;
+        jmp flags_advance;
+
+      // ---- --wipe: 'w' 'i' 'p' 'e' NUL ----
+      flags_try_wipe:
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x69; jne flags_advance;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x70; jne flags_advance;  // 'p'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x65; jne flags_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0;    jne flags_advance;  // NUL
+        mov rax, 1;
+        lea r11, [rip + flag_wipe];
+        mov [r11], rax;
+        jmp flags_advance;
+
+      // ---- --dry-run: 'd' 'r' 'y' '-' 'r' 'u' 'n' NUL ----
+      flags_try_dry_run:
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x72; jne flags_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x79; jne flags_advance;  // 'y'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x2D; jne flags_advance;  // '-'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x75; jne flags_advance;  // 'u'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6E; jne flags_advance;  // 'n'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_advance;  // NUL
+        mov rax, 1;
+        lea r11, [rip + flag_dry_run];
+        mov [r11], rax;
+        jmp flags_advance;
+
+      flags_advance:
+        add r8, 1;
+        jmp flags_scan_loop_head;
+
+      flags_scan_done:
+        ret
+      }
+    }
+}

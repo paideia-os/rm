@@ -1,0 +1,167 @@
+// src/main.pdx — rm.M1-002
+// RmMain module: rm_main(argc, argv) entry point.
+//
+// Scope
+// -----
+// The paideia-as loader stub reads argc/argv from the stack per the
+// SysV/x86_64 convention and calls rm_main(argc in rdi, argv in rsi);
+// rm_main's return value is the process exit code the loader stub
+// passes to sys_exit (paideia-os syscall #60).
+//
+// Flow:
+//   1. ParsedArgs::reset()                          — libpdx-argv
+//   2. Parser::parse_argv(argv, argc)               — libpdx-argv
+//        rax != 0 → print PARSE_FAIL_MSG on stderr, return EXIT_USAGE
+//   3. RmFlags::flags_reset()                       — this repo
+//   4. RmFlags::flags_scan()                        — this repo
+//   5. Load ParsedArgs::pos_count.
+//        == 0 → print USAGE_MSG on stderr, return EXIT_USAGE
+//   6. Load ParsedArgs::pos_ptrs[0] = target_ptr
+//   7. RmRemove::remove_reset()                     — this repo
+//   8. RmRemove::rm_remove_body(target_ptr)         — this repo
+//   9. Return rax (the body's exit code)
+//
+// M1 accepts N positionals but only consumes pos_ptrs[0]. The M2
+// recursive-walk body reads pos_ptrs[1..pos_count] from the same
+// slots; the M2 patch is a body edit inside rm_remove_body, not a
+// rework of rm_main.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmMain (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF.
+//   - r11 is scratch; used in every lea for the ParsedArgs .bss
+//     externals and the two .rodata message bases.
+//   - 2-push prologue (rbx, r12) preserves argc + argv across the
+//     nested calls. rsp % 16 arithmetic:
+//         caller-of-rm_main:   rsp % 16 == 0
+//         after CALL:          rsp % 16 == 8   (return-address push)
+//         after push rbx:      rsp % 16 == 0
+//         after push r12:      rsp % 16 == 8
+//         after sub rsp, 8:    rsp % 16 == 0   ← every nested call ok
+//     Epilogue reverses. Mirror of pkg_main's frame shape.
+//
+// Cross-module externs consumed
+// -----------------------------
+//   ParsedArgs::reset             (libpdx-argv)
+//   ParsedArgs::pos_count         (libpdx-argv .bss)
+//   ParsedArgs::pos_ptrs          (libpdx-argv .bss, [u64;32])
+//   Parser::parse_argv            (libpdx-argv)
+//   RmFlags::flags_reset          (this repo)
+//   RmFlags::flags_scan           (this repo)
+//   RmRemove::remove_reset        (this repo)
+//   RmRemove::rm_remove_body      (this repo)
+//   Print::print_err              (this repo)
+
+module RmMain = structure {
+
+  // -- Exit codes (public so tests / consumers can match on them) ------
+  pub let EXIT_OK                 : u64 = 0
+  pub let EXIT_OP_FAIL            : u64 = 1
+  pub let EXIT_USAGE              : u64 = 2
+
+  // -- Diagnostic strings ----------------------------------------------
+  // Emitted on stderr when libpdx-argv reports a parse error. M3-002
+  // replaces this with a `doc rm --help` invocation once doc.M2 lands;
+  // M1 keeps the message small and hand-rolled so rm has no dep on
+  // `doc` at M1 (mirror of pkg / mkdir / cat discipline).
+  pub let PARSE_FAIL_MSG : [u8; 38] =
+    "rm: argv parse error (run 'rm --help')\n"
+  pub let PARSE_FAIL_MSG_LEN : u64 = 38
+
+  // Emitted on stderr when the caller supplied zero positionals. The
+  // message names the M1 flag vocabulary in the order §5.8 lists it
+  // so a caller who runs `rm` alone sees exactly what M1 supports.
+  pub let USAGE_MSG : [u8; 46] =
+    "usage: rm [-r|-f|-v|--wipe|--dry-run] <path>\n"
+  pub let USAGE_MSG_LEN : u64 = 46
+
+  // ============================================================================
+  // rm_main(argc, argv) -> exit_code
+  //
+  // Signature: rm_main : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input): argc — number of argv entries
+  // RSI (input): argv — pointer to a u64 array of NUL-terminated arg ptrs
+  // RAX (output): exit code (0 ok / 1 op-fail / 2 usage)
+  //
+  // Register plan (2-push + 8-byte reserved pad frame):
+  //   rbx = argv        (preserved across every nested call)
+  //   r12 = argc        (preserved across every nested call)
+  //   [rsp + 0] = pad   (keeps rsp%16 == 0 at every nested call site)
+  //   rax = call return / temp
+  //   rdi, rsi = nested-call arg carriers
+  //   r11 = lea scratch
+  //
+  // See the "paideia-as compliance" comment above for the rsp %16
+  // arithmetic that justifies the sub rsp,8 pad.
+  // ============================================================================
+  pub let rm_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (argc: u64) (argv: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.M1-002 rm_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv → scan flags → validate positional count → dispatch to RmRemove::rm_remove_body. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (ParsedArgs::reset, Parser::parse_argv, RmFlags::flags_reset, RmFlags::flags_scan, Print::print_err, RmRemove::remove_reset, RmRemove::rm_remove_body). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see its Parser::parse_argv justification declaring leaf semantics) and through the RmFlags / RmRemove leaves. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Zero-positional path: print USAGE_MSG on stderr; return EXIT_USAGE. Otherwise: dispatch on pos_ptrs[0]. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying rm_remove_body's exit code (or 2 on parse-fail / no-positional).",
+      block: {
+        // Prologue: preserve argc/argv, align stack.
+        push rbx;                              // rsp%16: 8 → 0
+        push r12;                              // rsp%16: 0 → 8
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov rbx, rsi;                          // rbx = argv
+        mov r12, rdi;                          // r12 = argc
+
+        // Step 1: reset libpdx-argv state.
+        call ParsedArgs::reset;
+
+        // Step 2: parse. rdi = argv, rsi = argc (libpdx-argv ABI).
+        mov rdi, rbx;
+        mov rsi, r12;
+        call Parser::parse_argv;
+
+        // Step 3: check parse error. rax == 0 (ERR_OK) → continue.
+        cmp rax, 0;
+        je rm_main_parse_ok;
+
+        // Parse failed: print diagnostic on stderr, return EXIT_USAGE.
+        lea rdi, [rip + PARSE_FAIL_MSG];
+        mov rsi, 38;                           // PARSE_FAIL_MSG_LEN
+        call Print::print_err;
+        mov rax, 2;                            // EXIT_USAGE
+        jmp rm_main_epilogue;
+
+      rm_main_parse_ok:
+        // Step 4: reset + scan the flag slots.
+        call RmFlags::flags_reset;
+        call RmFlags::flags_scan;
+
+        // Step 5: check pos_count. rax = ParsedArgs::pos_count.
+        lea r11, [rip + ParsedArgs::pos_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne rm_main_have_target;
+
+        // No positional supplied → print USAGE_MSG on stderr, return 2.
+        lea rdi, [rip + USAGE_MSG];
+        mov rsi, 46;                           // USAGE_MSG_LEN
+        call Print::print_err;
+        mov rax, 2;                            // EXIT_USAGE
+        jmp rm_main_epilogue;
+
+      rm_main_have_target:
+        // Step 6-7: reset the remove-body's per-invocation counter.
+        call RmRemove::remove_reset;
+
+        // Step 8: dispatch to rm_remove_body(target_ptr).
+        // target_ptr = ParsedArgs::pos_ptrs[0].
+        lea r11, [rip + ParsedArgs::pos_ptrs];
+        mov rdi, [r11 + 0];                    // pos_ptrs[0]
+        call RmRemove::rm_remove_body;
+
+      rm_main_epilogue:
+        // Restore stack, return with rax carrying the exit code.
+        add rsp, 8;                            // undo pad
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}
