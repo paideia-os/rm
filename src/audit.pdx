@@ -1,0 +1,319 @@
+// src/audit.pdx -- rm.M3-002
+// RmAudit module: RemoveRecord via libpdx-audit before trash-move.
+//
+// Scope
+// -----
+// This module implements the M3-002 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M3-002 line): "RemoveRecord via libpdx-audit
+// before trash-move". The D3 audit-first invariant says every rm
+// invocation MUST journal its intent to /system/audit/user-events/
+// before it emits any user-visible output; every per-target removal
+// MUST journal its RemoveRecord before the trash-move commits.
+//
+// Wire shape (per libpdx-audit's three-call API at
+// libpdx-audit/src/audit_client.pdx §AuditClient):
+//
+//   audit_pre(op_args_ptr)
+//     → AuditClient::audit_begin("rm", op_args_ptr) -> audit_id
+//     → store audit_id in audit_id_slot for later record_output +
+//       commit reference (BEGUN state gated correctly on this id)
+//     → bump audit_begin_ok on non-zero return; bump audit_begin_err
+//       on zero return (broker unreachable / state error)
+//
+//   audit_record_target(target_ptr)
+//     → AuditClient::audit_record_output(audit_id,
+//                                        &RmSchema::SCHEMA_LABEL,
+//                                        target_ptr as u64_hash)
+//     → bump audit_records_out on SP_OK, audit_records_err else
+//     → M3 the "output_hash" argument is the target_ptr cast to u64.
+//       The M3 → substrate transition upgrades this to a BLAKE3-
+//       truncated hash of the target path bytes; the wire slot stays
+//       u64 either way so no signature edit is needed.
+//
+//   audit_post(exit_code)
+//     → AuditClient::audit_commit(audit_id, exit_code)
+//     → bump audit_commit_ok on SP_OK, audit_commit_err else
+//     → clear audit_id_slot to 0 so a subsequent rm_main invocation
+//       (if this process is ever reused) starts from a known baseline
+//
+// Failure semantics at M3
+// -----------------------
+// libpdx-audit's D3 contract (§5.13 M2-002 in the plan doc) says a
+// tool that cannot prove its audit trail was journalled MUST exit 3
+// with no output emission. At HEAD there is no live audit-broker
+// (svc.audit-journal is scheduled at R49-PREP-006). Enforcing the
+// exit-3 gate at M3 would make every rm invocation refuse output
+// which makes the M4 smoke matrix unrunnable before the broker lands.
+//
+// M3-002 therefore observes the audit calls but does NOT gate rm's
+// output on audit_can_emit_output. The M4 wire-up adds the gate
+// alongside a smoke harness that guarantees the broker is present.
+// Same "faithfully emit shape without inventing outcome" discipline
+// the M2 skeleton observes for PdxFS mutating ops.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmAudit (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0 and 1 appear).
+//   - r11 is scratch (used for every lea).
+//   - No byte reads in this module (only .bss loads/stores; no path
+//     inspection).
+//   - audit_pre prologue: sub rsp, 8 pad; entry rsp % 16 == 8, post-
+//     sub rsp % 16 == 0 for the nested AuditClient::audit_begin call.
+//   - audit_record_target prologue: sub rsp, 8 pad; same shape.
+//   - audit_post prologue: sub rsp, 8 pad; same shape.
+
+module RmAudit = structure {
+
+  // -- Static op-name string for AuditClient::audit_begin ---------------
+  //
+  // 3 bytes = "rm" + NUL. libpdx-audit stores this pointer verbatim
+  // into record_op_name_ptr; the audit-journal reader will read the
+  // NUL-terminated string when it renders the record.
+  pub let OP_NAME     : [u8; 3] = "rm\0"
+  pub let OP_NAME_LEN : u64     = 2
+
+  // -- .bss observability slots -----------------------------------------
+  //
+  // audit_id_slot         — audit_id returned from audit_begin; used as
+  //                          the (state, id) gate argument in
+  //                          audit_record_output and audit_commit
+  //                          per the two-gate contract at
+  //                          libpdx-audit/src/audit_client.pdx §41.
+  //                          0 means "no audit in progress" (matches
+  //                          libpdx-audit's own zero-sentinel).
+  //
+  // audit_begin_ok        — 1 if audit_begin returned a non-zero id.
+  // audit_begin_err       — 1 if audit_begin returned 0 (bad state or
+  //                          broker unreachable).
+  // audit_records_out     — number of successful audit_record_output
+  //                          calls (per-target output records).
+  // audit_records_err     — number of non-OK audit_record_output calls.
+  // audit_commit_ok       — 1 if audit_commit returned AUDIT_OK.
+  // audit_commit_err      — 1 if audit_commit returned non-OK.
+  pub let mut audit_id_slot      : u64 = uninit @align(8)
+  pub let mut audit_begin_ok     : u64 = uninit @align(8)
+  pub let mut audit_begin_err    : u64 = uninit @align(8)
+  pub let mut audit_records_out  : u64 = uninit @align(8)
+  pub let mut audit_records_err  : u64 = uninit @align(8)
+  pub let mut audit_commit_ok    : u64 = uninit @align(8)
+  pub let mut audit_commit_err   : u64 = uninit @align(8)
+
+  // ============================================================================
+  // audit_reset()
+  //
+  // Signature: audit_reset : () -> () !{mem} @{}
+  //
+  // Zero the seven .bss slots so a fresh rm_main invocation starts
+  // from a known baseline. Called from RmRemove::remove_reset. Leaf.
+  // ============================================================================
+  pub let audit_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.M3-002 audit_reset. Zero the seven observability slots (audit_id_slot, audit_begin_ok, audit_begin_err, audit_records_out, audit_records_err, audit_commit_ok, audit_commit_err) so a fresh rm_main invocation starts baseline. xor rax,rax produces the zero constant; seven lea+mov pairs write it. r11 is scratch. Leaf function; no push/pop parity to preserve.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + audit_id_slot];        mov [r11], rax;
+        lea r11, [rip + audit_begin_ok];       mov [r11], rax;
+        lea r11, [rip + audit_begin_err];      mov [r11], rax;
+        lea r11, [rip + audit_records_out];    mov [r11], rax;
+        lea r11, [rip + audit_records_err];    mov [r11], rax;
+        lea r11, [rip + audit_commit_ok];      mov [r11], rax;
+        lea r11, [rip + audit_commit_err];     mov [r11], rax;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_pre(op_args_ptr) -> audit_id
+  //
+  // Signature: audit_pre : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+  // RDI (input):  op_args_ptr — pointer to a NUL-terminated summary of
+  //                              the invocation's argv (may be 0; the
+  //                              audit reader is permitted to render a
+  //                              record with no argv summary)
+  // RAX (output): audit_id (>0) on begin success, 0 on failure. The id
+  //               is also stored in audit_id_slot for later commit
+  //               reference so the caller may discard the return value.
+  //
+  // Called from RmMain::rm_main immediately before dispatch. The M3
+  // → substrate transition strengthens this with an
+  // audit_can_emit_output()==0 → exit 3 gate; at M3 the failure is
+  // observable via audit_begin_err.
+  //
+  // Register plan (leaf; one nested call):
+  //   sub rsp, 8  — align rsp%16 to 0 for AuditClient::audit_begin
+  //   rdi = op_name       (arg 1 = &OP_NAME)
+  //   rsi = op_args_ptr   (arg 2 = caller's op_args, forwarded as-is)
+  //   rax = begin return / observability scratch
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let audit_pre : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (op_args_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M3-002 audit_pre. Wrap AuditClient::audit_begin (op_name=&OP_NAME, op_args=op_args_ptr) and stash the returned audit_id in audit_id_slot for later commit reference. On non-zero id bump audit_begin_ok; on zero id (state-error or broker-unreachable) bump audit_begin_err. Failure is non-fatal at M3 (see file-header §Failure semantics); the M4 wire-up adds the exit-3 gate. Effect tail !{mem, sysreg} @{cap, sched} matches the callee (libpdx-audit AuditClient::audit_begin declares the same tail; see libpdx-audit/src/audit_client.pdx L53). Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the nested call. rsi is caller's op_args_ptr forwarded as-is (SysV arg 2 → arg 2 slot). Matched add rsp, 8 in both return paths. r11 scratch first for lea OP_NAME then for the .bss slot writes (uses do not overlap).",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // Arg 1: op_name = &OP_NAME. Arg 2: rsi already carries op_args_ptr
+        // from the caller (SysV rdi=op_args_ptr on entry to audit_pre).
+        mov rsi, rdi;                          // rsi = op_args_ptr (arg 2)
+        lea rdi, [rip + OP_NAME];              // rdi = &OP_NAME  (arg 1)
+        call AuditClient::audit_begin;
+
+        // Stash id + observability.
+        lea r11, [rip + audit_id_slot];
+        mov [r11], rax;                        // audit_id_slot = returned id
+
+        cmp rax, 0;
+        je audit_pre_err;
+
+        // id > 0: begin OK.
+        mov rcx, 1;
+        lea r11, [rip + audit_begin_ok];
+        mov [r11], rcx;
+        add rsp, 8;
+        ret
+
+      audit_pre_err:
+        // id == 0: begin failed.
+        mov rcx, 1;
+        lea r11, [rip + audit_begin_err];
+        mov [r11], rcx;
+        xor rax, rax;                          // return 0
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_record_target(target_ptr) -> u64
+  //
+  // Signature: audit_record_target : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+  // RDI (input):  target_ptr — NUL-terminated path pointer
+  // RAX (output): AuditClient::audit_record_output return code
+  //               (0 = AUDIT_OK, non-zero otherwise).
+  //
+  // Called from RmRemove::rm_process_one and RmWalk::walk_recursive
+  // per successful removal (per-positional at M3; per-entry once the
+  // recursive-walk substrate lands). Composes the audit_record_output
+  // call with:
+  //   audit_id       = audit_id_slot (stashed by audit_pre)
+  //   output_schema  = &RmSchema::SCHEMA_LABEL ("RemoveRecord@0.1")
+  //   output_hash    = target_ptr (cast to u64; M3 stub — the M3 →
+  //                    substrate transition replaces this with a
+  //                    BLAKE3-truncated hash of the target path bytes)
+  //
+  // The output_hash choice is a placeholder that satisfies the libpdx-
+  // audit wire (u64 hash slot) while the real hash routine lands.
+  // Consumers reading the audit journal at M3 see the target-pointer
+  // value as a stable-per-invocation identifier that survives across
+  // multiple record_output calls for the same target.
+  //
+  // Register plan (leaf; one nested call):
+  //   sub rsp, 8  — align rsp%16 to 0 for AuditClient::audit_record_output
+  //   rdi = audit_id       (arg 1 — loaded from audit_id_slot)
+  //   rsi = output_schema  (arg 2 = &SCHEMA_LABEL from RmSchema)
+  //   rdx = output_hash    (arg 3 = target_ptr, forwarded)
+  //   rax = record_output return / observability scratch
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let audit_record_target : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M3-002 audit_record_target. Wrap AuditClient::audit_record_output (audit_id=audit_id_slot, output_schema=&RmSchema::SCHEMA_LABEL, output_hash=target_ptr) so every successful removal journals a per-target output record. output_hash at M3 is the target_ptr cast to u64 — a stable-per-invocation identifier that survives multiple record_output calls for the same target; the M3 → substrate transition swaps in a BLAKE3-truncated hash of the target path bytes when the hash routine lands (no signature edit needed). On AUDIT_OK (rax == 0) bump audit_records_out; on non-zero bump audit_records_err. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the nested call. Effect tail !{mem, sysreg} @{cap, sched} matches the callee. rdx set to target_ptr (from rdi via a save-through pattern that avoids reordering — the callee reads rdi, rsi, rdx in that order so we assign rdx last from rdi's original value before we overwrite rdi with audit_id). r11 scratch first for lea SCHEMA_LABEL then for audit_id_slot load then for observability writes (uses do not overlap).",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // Compose the three-arg call. Order matters: rdx from rdi's
+        // original before we overwrite rdi with the audit_id.
+        mov rdx, rdi;                          // rdx = target_ptr (arg 3)
+        lea rsi, [rip + RmSchema::SCHEMA_LABEL]; // rsi = &SCHEMA_LABEL (arg 2)
+        lea r11, [rip + audit_id_slot];
+        mov rdi, [r11];                        // rdi = audit_id_slot (arg 1)
+
+        call AuditClient::audit_record_output;
+
+        // Observability: bump ok / err based on rc.
+        cmp rax, 0;
+        jne audit_rt_err;
+
+        lea r11, [rip + audit_records_out];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+        add rsp, 8;
+        ret
+
+      audit_rt_err:
+        lea r11, [rip + audit_records_err];
+        mov rcx, [r11];
+        add rcx, 1;
+        mov [r11], rcx;
+        add rsp, 8;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // audit_post(exit_code) -> u64
+  //
+  // Signature: audit_post : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+  // RDI (input):  exit_code — the rm exit code that will be returned
+  //                            from rm_main (0 = EXIT_OK, 1 =
+  //                            EXIT_OP_FAIL, 2 = EXIT_USAGE, 3 =
+  //                            EXIT_NOT_YET_IMPL).
+  // RAX (output): AuditClient::audit_commit return code
+  //               (0 = AUDIT_OK, non-zero otherwise).
+  //
+  // Called from RmMain::rm_main after rm_remove_body returns and
+  // before rm_main's own ret. On AUDIT_OK bumps audit_commit_ok and
+  // clears audit_id_slot to 0 (so a subsequent rm_main call starts
+  // from a known baseline); on non-OK bumps audit_commit_err (leaves
+  // audit_id_slot at its BEGUN value so a post-mortem can walk it).
+  //
+  // Register plan (leaf; one nested call):
+  //   sub rsp, 8  — align rsp%16 to 0 for AuditClient::audit_commit
+  //   rdi = audit_id  (arg 1 — loaded from audit_id_slot)
+  //   rsi = exit_code (arg 2 — from caller's rdi)
+  //   rax = commit return / observability scratch
+  //   r11 = lea scratch
+  // ============================================================================
+  pub let audit_post : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (exit_code: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M3-002 audit_post. Wrap AuditClient::audit_commit (audit_id=audit_id_slot, exit_code=caller's rdi). On AUDIT_OK bump audit_commit_ok and clear audit_id_slot to 0 (so a subsequent rm_main call starts from a known baseline); on non-OK bump audit_commit_err (leave audit_id_slot at its BEGUN value so a post-mortem can walk it). rsi assigned from rdi's original before rdi is overwritten with audit_id_slot's contents (arg-shift ordering matches audit_record_target). Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the nested call. Effect tail !{mem, sysreg} @{cap, sched} matches the callee. r11 scratch first for audit_id_slot load then for observability writes (uses do not overlap). Return audit_commit's rc verbatim so a caller who wants to distinguish AUDIT_OK / AUDIT_ERR_BROKER_UNAVAILABLE / AUDIT_ERR_SEND_FAILED can.",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        mov rsi, rdi;                          // rsi = exit_code (arg 2)
+        lea r11, [rip + audit_id_slot];
+        mov rdi, [r11];                        // rdi = audit_id (arg 1)
+
+        call AuditClient::audit_commit;
+
+        cmp rax, 0;
+        jne audit_post_err;
+
+        // AUDIT_OK path: bump commit_ok, clear audit_id_slot.
+        mov rcx, 1;
+        lea r11, [rip + audit_commit_ok];
+        mov [r11], rcx;
+        xor rcx, rcx;
+        lea r11, [rip + audit_id_slot];
+        mov [r11], rcx;
+        xor rax, rax;                          // return AUDIT_OK
+        add rsp, 8;
+        ret
+
+      audit_post_err:
+        mov rcx, 1;
+        lea r11, [rip + audit_commit_err];
+        mov [r11], rcx;
+        // rax carries the underlying err code — propagate verbatim.
+        add rsp, 8;
+        ret
+      }
+    }
+}

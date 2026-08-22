@@ -1,4 +1,4 @@
-// src/main.pdx — rm.M3-001 (extends M1-002)
+// src/main.pdx — rm.M3-002 (extends M3-001)
 // RmMain module: rm_main(argc, argv) entry point.
 //
 // Scope
@@ -99,7 +99,7 @@ module RmMain = structure {
   pub let rm_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M1-002 rm_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: parse via libpdx-argv → scan flags → validate positional count → dispatch to RmRemove::rm_remove_body. 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site (ParsedArgs::reset, Parser::parse_argv, RmFlags::flags_reset, RmFlags::flags_scan, Print::print_err, RmRemove::remove_reset, RmRemove::rm_remove_body). rbx/r12 preserved across every nested call — the callee-save contract from SysV holds through libpdx-argv (see its Parser::parse_argv justification declaring leaf semantics) and through the RmFlags / RmRemove leaves. Parse-fail path: print PARSE_FAIL_MSG on stderr; return EXIT_USAGE. Zero-positional path: print USAGE_MSG on stderr; return EXIT_USAGE. Otherwise: dispatch on pos_ptrs[0]. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. Return: pop the pad, pop r12, pop rbx, ret with rax carrying rm_remove_body's exit code (or 2 on parse-fail / no-positional).",
+      justification: "rm.M3-002 rm_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset (ParsedArgs + RmRemove umbrella which zeroes every M3 module's observability including audit) → audit_pre (envelope open, so every exit path can journal a commit) → parse → scan flags → schema_bind_stdout (M3-001) → validate positional count → dispatch to RmRemove::rm_remove_body → audit_post (envelope close with exit code). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site. rbx preserved across every nested call by SysV callee-save; r12 preserved through dispatch and re-purposed at the epilogue to hold the exit code across the RmAudit::audit_post call (argc no longer needed after dispatch). Parse-fail path: print PARSE_FAIL_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. Zero-positional path: print USAGE_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. Otherwise: dispatch on pos_ptrs[0], audit_post commits with rm_remove_body's rax. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. remove_reset hoisted to top of body so audit_pre's audit_id_slot survives the reset envelope; if audit_pre came before remove_reset the zero would clobber the id. Return: pop pad, pop r12, pop rbx, ret with rax carrying the exit code preserved across audit_post via r12.",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 → 0
@@ -109,8 +109,20 @@ module RmMain = structure {
         mov rbx, rsi;                          // rbx = argv
         mov r12, rdi;                          // r12 = argc
 
-        // Step 1: reset libpdx-argv state.
+        // Step 1: reset all state up-front (libpdx-argv + RmRemove
+        // umbrella which zeroes every M3 module's observability slots
+        // including audit_id_slot). Hoisted from the have_target branch
+        // at M3-002 so audit_pre's audit_id_slot survives the reset.
         call ParsedArgs::reset;
+        call RmRemove::remove_reset;
+
+        // Step 1b (M3-002): open the audit envelope. op_args=0 at M3
+        // (audit-reader is permitted to render a record with no argv
+        // summary). Failure is non-fatal at M3 (see audit.pdx §Failure
+        // semantics); observability lives in audit_begin_ok /
+        // audit_begin_err.
+        xor rdi, rdi;                          // op_args_ptr = 0
+        call RmAudit::audit_pre;
 
         // Step 2: parse. rdi = argv, rsi = argc (libpdx-argv ABI).
         mov rdi, rbx;
@@ -153,16 +165,23 @@ module RmMain = structure {
         jmp rm_main_epilogue;
 
       rm_main_have_target:
-        // Step 6-7: reset the remove-body's per-invocation counter.
-        call RmRemove::remove_reset;
-
-        // Step 8: dispatch to rm_remove_body(target_ptr).
+        // Step 8: dispatch to rm_remove_body(target_ptr). remove_reset
+        // was hoisted to the top of the body at M3-002.
         // target_ptr = ParsedArgs::pos_ptrs[0].
         lea r11, [rip + ParsedArgs::pos_ptrs];
         mov rdi, [r11 + 0];                    // pos_ptrs[0]
         call RmRemove::rm_remove_body;
 
       rm_main_epilogue:
+        // Step 9 (M3-002): commit the audit envelope. Preserve the exit
+        // code across audit_post via r12 (argc no longer needed at the
+        // epilogue; SysV callee-save on r12 covers the audit_post call
+        // fanout).
+        mov r12, rax;                          // r12 = exit_code
+        mov rdi, rax;                          // arg1 = exit_code
+        call RmAudit::audit_post;
+        mov rax, r12;                          // restore exit_code
+
         // Restore stack, return with rax carrying the exit code.
         add rsp, 8;                            // undo pad
         pop r12;

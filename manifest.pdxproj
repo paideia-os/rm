@@ -31,6 +31,7 @@ sources:
   - src/retention.pdx             # RmRetention::retention_attach (M2-003)
   - src/wipe.pdx                  # RmWipe::wipe_emit (M2-004)
   - src/schema.pdx                # RmSchema: RemoveRecord@0.1 bind + emit (M3-001)
+  - src/audit.pdx                 # RmAudit: audit_pre + audit_record_target + audit_post (M3-002)
   - src/main.pdx                  # rm_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------
@@ -43,6 +44,7 @@ sources:
 deps:
   - libpdx-argv @ ^0.1
   - libpdx-semantic-pipe @ ^0.2
+  - libpdx-audit @ ^0.2
 
 # --- Paideia-as compliance flags ---------------------------------------
 # These mirror the invariants every R49/R50 tool observes and every M1

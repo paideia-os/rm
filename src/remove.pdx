@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M3-001 (extends M2-004)
+// src/remove.pdx — rm.M3-002 (extends M3-001)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -138,10 +138,10 @@ module RmRemove = structure {
   // Prologue: sub rsp, 8 pad (entry rsp%16 == 8 → post-sub 0) for the
   // nested schema_reset call. Matched add rsp, 8 before ret.
   // ============================================================================
-  pub let remove_reset : () -> () !{mem, sysreg} @{cap} =
+  pub let remove_reset : () -> () !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "rm.M3-001 remove_reset. Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count), then delegate to RmSchema::schema_reset. Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap} to cover the schema-reset callee tail (schema_reset itself is !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the nested call. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M3-002 remove_reset. Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count), then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset). Delegation keeps each module's .bss visibility internal — RmRemove does not need to enumerate the RmSchema / RmAudit slots and does not need to update this body every time an M3 module adds an observability slot. Effect tail widened to !{mem, sysreg} @{cap, sched} to cover the audit_reset callee tail (audit_reset itself is !{mem} @{} but the signature commits to what a future early-broker-warmup body edit could add without a signature widening at this call site). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the two nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write. All immediates 0.",
       block: {
         sub rsp, 8;                                 // rsp%16: 8 → 0
 
@@ -154,6 +154,7 @@ module RmRemove = structure {
 
         // Delegate to M3 module resets.
         call RmSchema::schema_reset;
+        call RmAudit::audit_reset;
 
         add rsp, 8;
         ret
@@ -364,10 +365,10 @@ module RmRemove = structure {
   //          (a shred does not create a trash-subtree entry, so no
   //          retention applies; the audit flag is set for M3-002).
   // ============================================================================
-  pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{cap} =
+  pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (target_ptr: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {cap},
-      justification: "rm.M3-001 rm_process_one (extended through M2-004). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then M3-001 record_emit fires (RemoveRecord@0.1 with target_ptr + target_len + was_dir=0 + trash_handle=0). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hook (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints retention_attach + M3-001 record_emit + M2_STUB_SUFFIX. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site. rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail widened to !{mem, sysreg} @{cap} to cover the semantic-pipe send-record call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.M3-002 rm_process_one (extended through M3-001). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then the M3 hooks fire (RmSchema::record_emit + RmAudit::audit_record_target). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hooks (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints retention_attach + record_emit + audit_record_target + M2_STUB_SUFFIX. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site (confirm_check, wipe_emit, four Print::print_str, retention_attach, record_emit, audit_record_target). rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail widened to !{mem, sysreg} @{cap, sched} to cover the semantic-pipe + audit call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
       block: {
         // Prologue: preserve target_ptr + target_len across every hook.
         push rbx;                              // rsp%16: 8 → 0
@@ -409,7 +410,7 @@ module RmRemove = structure {
         cmp rax, 0;
         je rm_process_part1;                   // no wipe: default path
 
-        // --wipe branch: shred emit, then M3-001 record emit.
+        // --wipe branch: shred emit, then M3 hooks.
         mov rdi, rbx;                          // arg = target_ptr
         call RmWipe::wipe_emit;
 
@@ -419,6 +420,10 @@ module RmRemove = structure {
         xor rdx, rdx;                          // was_dir = 0 (M3 stub)
         xor rcx, rcx;                          // trash_handle = 0 (M3 stub)
         call RmSchema::record_emit;
+
+        // M3-002 audit record (wipe path).
+        mov rdi, rbx;
+        call RmAudit::audit_record_target;
 
         jmp rm_process_done_ok;
 
@@ -476,6 +481,10 @@ module RmRemove = structure {
         xor rdx, rdx;
         xor rcx, rcx;
         call RmSchema::record_emit;
+
+        // ---- M3-002: audit record (default path) -------------------------
+        mov rdi, rbx;
+        call RmAudit::audit_record_target;
 
         // ---- M2 stub suffix (visual: names the substrate gap) -----------
         lea rdi, [rip + M2_STUB_SUFFIX];
