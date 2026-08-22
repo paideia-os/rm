@@ -108,6 +108,17 @@ breakdown.
   (snapshot matches). Uses r10 to stage the 24h imm64 for the compare
   (paideia-as r11 imm64 sweep pattern; r10 free because r11 holds the
   .bss lea base). Fingerprint: `[rm.M4-002 OK]` / `[rm.M4-002 FAIL]`.
+- `tests/m4_003_undo_after_window.pdx` (issue #14, M4-003): undo
+  after retention window returns ENOENT-with-diagnostic (not silent).
+  Asserts the composition precondition the replay's diagnostic
+  dispatch depends on: `_undo_scratch[32]` (retention lane in the
+  6-lane undo record) is populated with a non-zero deadline AND
+  equals both `RmRetention::retention_deadline_ns` and
+  `RmUndo::undo_last_deadline_ns`. A zero lane would leave the replay
+  unable to distinguish "expired" from "never written"; a mismatch
+  would let the diagnostic name a wrong deadline. Uses reg-reg
+  compares via r8 so no imm64 stage is needed for the 24h constant.
+  Fingerprint: `[rm.M4-003 OK]` / `[rm.M4-003 FAIL]`.
 
 ## Milestone rollup
 
@@ -126,7 +137,7 @@ breakdown.
 | M3-004 (#11) | libpdx-elevate for /system/ + cross-subtree targets                | LANDED |
 | M4-001 (#12) | TXN-abort mid-remove: no files removed                             | LANDED |
 | M4-002 (#13) | undo within retention window succeeds                              | LANDED |
-| M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | TBD    |
+| M4-003 (#14) | undo after retention window: ENOENT-with-diagnostic                | LANDED |
 | M4-004 (#15) | --wipe audit flag correctness (forensic-shred detection)           | TBD    |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)

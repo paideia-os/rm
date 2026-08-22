@@ -7,7 +7,7 @@ four M4 issues from paideia-os `design/tooling/r49-r50-plan.md` §5.8:
 |-------------------------------------------------------------|-----------------------------------|--------|
 | rm.M4-001 TXN-abort mid-remove: no files removed            | `m4_001_txn_abort.pdx`            | LANDED |
 | rm.M4-002 undo within retention window succeeds             | `m4_002_undo_in_window.pdx`       | LANDED |
-| rm.M4-003 undo after retention window: ENOENT-w/-diagnostic | `m4_003_undo_after_window.pdx`    | TBD    |
+| rm.M4-003 undo after retention window: ENOENT-w/-diagnostic | `m4_003_undo_after_window.pdx`    | LANDED |
 | rm.M4-004 `--wipe` audit flag correctness                   | `m4_004_wipe_forensic.pdx`        | TBD    |
 
 ## Test discipline

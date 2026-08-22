@@ -1,0 +1,181 @@
+// tests/m4_003_undo_after_window.pdx -- rm.M4-003
+// M4Test003 module: undo after retention window returns ENOENT-with-
+// diagnostic (not silent).
+//
+// Scope
+// -----
+// This module implements the M4-003 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8 M4-003 line): "undo after retention window
+// returns ENOENT-with-diagnostic (not silent)". The invariant under
+// test is: once the 24h retention deadline has passed, an `undo rm
+// <target>` request MUST return a clean ENOENT-with-diagnostic (an
+// explicit "trash entry reaped after 24h retention" error) rather
+// than silently succeeding-with-nothing or silently failing without
+// naming the reason.
+//
+// The distinction is load-bearing: a silent success would let an
+// operator believe an undo restored a file that was actually reaped;
+// a silent failure would give no forensic breadcrumb pointing at the
+// retention path. Both are D3 (design/tooling/plan.md) audit-first
+// violations. The ENOENT-with-diagnostic contract makes the failure
+// mode observable to both interactive users and downstream tools.
+//
+// Substrate proxy at M4 (test-shape without live clock fast-forward)
+// ------------------------------------------------------------------
+// A full-substrate M4 test would (a) call rm_process_one on a target,
+// (b) fast-forward the kernel clock past retention_deadline_ns, and
+// (c) invoke the undo-replay path and verify it returns ENOENT-with-
+// diagnostic. Neither the clock-fast-forward hook nor the undo-replay
+// binary exist at HEAD -- undo.pdx §Substrate note documents that
+// undo_write itself is composition-only until sys_pdxfs_undo_append
+// lands with R42-PREP-004.
+//
+// The M4 test therefore asserts the COMPOSITION PRECONDITION the
+// ENOENT-with-diagnostic dispatch depends on: the retention lane in
+// _undo_scratch is populated with a NONZERO deadline AND that
+// deadline equals RmRetention::retention_deadline_ns. If lane [32]
+// were zero (a zero-deadline is "expired immediately" for any
+// non-zero clock reading), the replay would return ENOENT silently
+// with no way to distinguish "retention expired" from "record was
+// never written". If lane [32] diverged from retention_deadline_ns,
+// the replay's diagnostic would name a wrong deadline.
+//
+// The M5 substrate commit extends this test with the fast-forward +
+// replay + ENOENT-diagnostic assertion; the composition invariant
+// stays as the M4 lower bound.
+//
+// M4 test invariants asserted here
+// --------------------------------
+// After one retention_attach + undo_write pair on a synthetic
+// non-/system/ target:
+//
+//   RmUndo::_undo_scratch[32]           != 0                (deadline
+//                                                             populated
+//                                                             in record)
+//   RmUndo::_undo_scratch[32]           == retention_deadline_ns
+//   RmUndo::undo_last_deadline_ns       == retention_deadline_ns
+//
+// The three assertions collectively guarantee the ENOENT-with-
+// diagnostic dispatch has a well-formed deadline to compare the
+// clock against and a well-formed observability snapshot to render
+// in the diagnostic. Any divergence prints M4-003 FAIL and returns 1.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module M4Test003 (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (only 0, 1, 11 appear as
+//     immediates here). The retention_deadline_ns cross-slot compare
+//     uses reg-reg cmp so no imm64 stage is needed for it.
+//   - r11 is scratch (every .bss lea).
+//   - No byte reads (all qword-wide slot inspection).
+//   - run_m4_003 prologue: sub rsp, 8 pad = 8 bytes; entry rsp % 16
+//     == 8, post-sub rsp % 16 == 0 for every nested call site
+//     (remove_reset, retention_attach, undo_write, print_str).
+
+module M4Test003 = structure {
+
+  // -- Target string ----------------------------------------------------
+  pub let TEST_TARGET     : [u8; 12] = "test_target\0"
+  pub let TEST_TARGET_LEN : u64      = 11
+
+  // -- Fingerprint lines emitted to stdout via Print::print_str --------
+  pub let OK_MSG     : [u8; 15] = "[rm.M4-003 OK]\n"
+  pub let OK_MSG_LEN : u64      = 15
+
+  pub let FAIL_MSG     : [u8; 17] = "[rm.M4-003 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 17
+
+  // ============================================================================
+  // run_m4_003() -> u64
+  //
+  // Signature: run_m4_003 : () -> u64 !{mem, sysreg} @{cap}
+  // RAX (output): 0 = OK, 1 = FAIL.
+  //
+  // Body:
+  //   (1) reset rm state.
+  //   (2) zero RmRetention slots (reset-list gap).
+  //   (3) call retention_attach + undo_write (same order as
+  //       rm_process_one's default branch).
+  //   (4) assert _undo_scratch[32] != 0, and equals
+  //       retention_deadline_ns, and equals undo_last_deadline_ns.
+  //   (5) print OK or FAIL; return 0 or 1.
+  //
+  // Register plan (leaf w.r.t. callee-saves; every nested call at
+  // aligned rsp):
+  //   sub rsp, 8   -- align rsp%16 to 0 for every nested call
+  //   rax = counter/store scratch + call return
+  //   rdi = call arg 1 (target_ptr for retention/undo; buf for print)
+  //   rsi = call arg 2 (target_len for undo; len for print)
+  //   rdx = call arg 3 (was_dir = 0)
+  //   rcx = call arg 4 (trash_handle = 0)
+  //   r8  = second-operand scratch for cross-slot reg-reg compares
+  //   r11 = lea scratch (.bss slot reads)
+  // ============================================================================
+  pub let run_m4_003 : () -> u64 !{mem, sysreg} @{cap} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap},
+      justification: "rm.M4-003 run_m4_003. Verifies the composition precondition an undo-replay's ENOENT-with-diagnostic dispatch depends on. Reset rm state (RmRemove::remove_reset delegates to undo_reset); zero RmRetention slots (reset-list gap per walk.pdx L99-105). Call retention_attach + undo_write in the same order rm_process_one's default branch uses (remove.pdx §rm_process_print_m2_suffix). Assert _undo_scratch[32] != 0 (a zero-deadline would leave the replay indistinguishable between 'retention expired' and 'record was never written'). Assert _undo_scratch[32] equals RmRetention::retention_deadline_ns via reg-reg compare (r8 holds retention_deadline_ns, rax holds _undo_scratch[32]) -- reg-reg avoids needing an imm64 stage for the 24h constant. Assert undo_last_deadline_ns matches retention_deadline_ns via a second reg-reg compare with r8 (retention_deadline_ns loaded once into r8 and reused across both compares). Any divergence prints FAIL and returns 1. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for every nested call site. r11 scratch: sequential uses across the reset-slot writes, the two calls, and every slot read; no overlap. r8 caller-save so no restore needed. All immediates 0, 1, or 11 (fit imm32). Effect tail !{mem, sysreg} @{cap} matches Print::print_str's callee tail.",
+      block: {
+        sub rsp, 8;                              // rsp%16: 8 -> 0
+
+        // (1) Reset rm state.
+        call RmRemove::remove_reset;
+
+        // (2) Zero RmRetention slots (reset-list gap).
+        xor rax, rax;
+        lea r11, [rip + RmRetention::retention_attach_count];
+        mov [r11], rax;
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov [r11], rax;
+
+        // (3) retention_attach + undo_write in rm_process_one order.
+        lea rdi, [rip + TEST_TARGET];
+        call RmRetention::retention_attach;
+
+        lea rdi, [rip + TEST_TARGET];
+        mov rsi, 11;                             // TEST_TARGET_LEN
+        xor rdx, rdx;                            // was_dir = 0
+        xor rcx, rcx;                            // trash_handle = 0
+        call RmUndo::undo_write;
+
+        // (4) Assertions.
+        //     _undo_scratch[32] != 0
+        lea r11, [rip + RmUndo::_undo_scratch];
+        mov rax, [r11 + 32];
+        cmp rax, 0;
+        je m4_003_fail;
+
+        //     _undo_scratch[32] == retention_deadline_ns
+        //     (rax already holds _undo_scratch[32]; load
+        //     retention_deadline_ns into r8 for the reg-reg cmp)
+        lea r11, [rip + RmRetention::retention_deadline_ns];
+        mov r8, [r11];
+        cmp rax, r8;
+        jne m4_003_fail;
+
+        //     undo_last_deadline_ns == retention_deadline_ns
+        //     (r8 still holds retention_deadline_ns)
+        lea r11, [rip + RmUndo::undo_last_deadline_ns];
+        mov rax, [r11];
+        cmp rax, r8;
+        jne m4_003_fail;
+
+        // (5) OK path.
+        lea rdi, [rip + OK_MSG];
+        mov rsi, 15;                             // OK_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        xor rax, rax;                            // 0 = OK
+        ret
+
+      m4_003_fail:
+        lea rdi, [rip + FAIL_MSG];
+        mov rsi, 17;                             // FAIL_MSG_LEN
+        call Print::print_str;
+        add rsp, 8;
+        mov rax, 1;                              // 1 = FAIL
+        ret
+      }
+    }
+}
