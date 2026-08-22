@@ -31,6 +31,13 @@ breakdown.
   or `confirm_prompts_stub` (flag_f == 0) and emits F_SKIP_NOTE /
   PROMPT_STUB_NOTE under -v. Called from `rm_process_one` before the
   target-print. `remove_reset` zeros the new counters.
+- `src/retention.pdx` + `src/remove.pdx` extend (issue #6, M2-003):
+  24h retention deadline metadata. New `RmRetention::retention_attach`
+  stages `RETENTION_24H_NS = 0x4E94914F0000` in r11 (imm64 sweep),
+  stores into `retention_deadline_ns`, bumps `retention_attach_count`,
+  emits RETENTION_NOTE under -v. Called from `rm_process_one`
+  non-dry-run path before the M2 stub suffix; skipped by dry-run and
+  by the walk branch (per-leaf hook lands with the substrate move).
 
 ## Milestone rollup
 
@@ -41,7 +48,7 @@ breakdown.
 | M1-003 (#3) | first runnable: single-file remove via trash-subtree move          | LANDED |
 | M2-001 (#4) | recursive -r leaf-first walk under single TXN (skeleton)           | LANDED |
 | M2-002 (#5) | -f force flag (skip per-file confirmation)                         | LANDED |
-| M2-003 (#6) | 24h retention deadline metadata on trash-subtree entry             | OPEN   |
+| M2-003 (#6) | 24h retention deadline metadata on trash-subtree entry             | LANDED |
 | M2-004 (#7) | --wipe: immediate trash-entry unlink + best-effort byte overwrite  | OPEN   |
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)

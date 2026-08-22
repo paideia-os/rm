@@ -297,3 +297,38 @@ under the -r entry.
 `RmRemove::remove_reset` now zeros the two new counters alongside
 `removed_count`; the counter-only observability at M2 is what the
 M4 smoke matrix reads back.
+
+### 8.3 M2-003 24h retention deadline metadata (issue #6)
+
+`RmRetention::retention_attach(target_ptr)` (new module
+`src/retention.pdx`) is called from `rm_process_one` in the
+non-dry-run branch, immediately before the `M2_STUB_SUFFIX` print.
+The helper:
+
+1. bumps `retention_attach_count`;
+2. stages `RETENTION_24H_NS = 0x4E94914F0000` (86_400_000_000_000)
+   into r11 via `mov r11, imm64` (the paideia-as r11 imm64 sweep
+   discipline — the value exceeds imm32's 0x7FFFFFFF window), then
+   stores it into `retention_deadline_ns`;
+3. under `flag_v == 1`, emits a 31-byte "trash retention: 24h (M2
+   stub)\n" note.
+
+At M2 `retention_deadline_ns` is the raw 24h ns constant; the M3
+upgrade to `sys_now_ns() + RETENTION_24H_NS` (absolute timestamp)
+is a body edit inside `retention_attach` that neither changes the
+signature nor the caller — `rm_process_one` continues to call it
+with the same `(target_ptr) -> ()` shape.
+
+The dry-run branch does NOT call `retention_attach`: no trash entry
+is (or will be) created under `--dry-run`, so no retention applies.
+The recursive walk branch (M2-001 `RmWalk::walk_recursive`) does
+NOT call `retention_attach` at M2 either — a substrate-live walk
+would call it per-leaf inside the walk loop, but the M2 walk emits
+only one line per top-level target and there is no per-entry hook
+to attach the retention onto. The M2 → substrate transition adds
+the hook alongside the readdir + move dispatch; no signature edits
+needed.
+
+M4-003 test invariant ("undo after retention window returns
+ENOENT-with-diagnostic, not silent") reads back `retention_
+deadline_ns` to verify the expected 24h window.

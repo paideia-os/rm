@@ -1,4 +1,4 @@
-// src/remove.pdx — rm.M2-002 (extends M2-001)
+// src/remove.pdx — rm.M2-003 (extends M2-002)
 // RmRemove module: the rm removal body.
 //
 // Scope at M2-001 (this milestone)
@@ -418,6 +418,13 @@ module RmRemove = structure {
         jmp rm_process_done_ok;
 
       rm_process_print_m2_suffix:
+        // ---- M2-003: attach 24h retention deadline metadata --------------
+        // retention_attach bumps its counter, stores 24h ns into its
+        // deadline observable, and emits a 31-byte note under -v. See
+        // src/retention.pdx for the mov r11, imm64 staging discipline.
+        mov rdi, rbx;                          // arg = target_ptr
+        call RmRetention::retention_attach;
+
         lea rdi, [rip + M2_STUB_SUFFIX];
         mov rsi, 61;                           // M2_STUB_SUFFIX_LEN
         call Print::print_str;

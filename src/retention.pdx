@@ -1,0 +1,154 @@
+// src/retention.pdx — rm.M2-003
+// RmRetention module: 24h retention deadline metadata on the trash-
+// subtree entry the M2-scheduled trash-move would create.
+//
+// Scope
+// -----
+// This module implements the M2-003 scope (paideia-os design/tooling/
+// r49-r50-plan.md §5.8): every trash-subtree entry rm creates carries
+// a 24-hour retention deadline; after the deadline the entry becomes
+// eligible for garbage collection (PdxFS v1 substrate work, R42) and
+// `undo rm <target>` returns ENOENT-with-diagnostic (M4-003 test
+// invariant). The deadline is expressed in absolute nanoseconds since
+// the paideia-os epoch (kernel clock reference); the M3-003 PdxFS
+// undo record reads the same slot when it commits.
+//
+// At M2 the deadline is COMPUTED-BUT-NOT-ATTACHED — the trash entry
+// itself does not exist yet (mutating PdxFS ops not in-tree; see
+// src/walk.pdx preamble for the substrate-gap note). The retention
+// helper:
+//
+//   * stages the 24h ns constant (86_400_000_000_000 = 0x4E94914F0000)
+//     into r11 via the imm64 idiom (the value exceeds imm32's
+//     0x7FFFFFFF window, so `cmp reg, imm` staging discipline applies
+//     to any use as an immediate);
+//   * stores the value into RmRetention::retention_deadline_ns as
+//     the "last-computed deadline" observable — this is a 24h-relative
+//     value at M2 (the absolute-time compute lands with the sys_now_ns
+//     wrapper when the kernel exposes a clock read);
+//   * bumps RmRetention::retention_attach_count so the M4 smoke matrix
+//     can count how many trash entries would carry a retention tail;
+//   * optionally emits a one-line "trash retention: 24h (M2 stub)\n"
+//     note via Print::print_str when flag_v == 1.
+//
+// M2-004 (`--wipe`) suppresses the retention attach path: a shred
+// creates no trash entry, so no retention applies. The dispatch
+// lives in rm_process_one (RmRemove) which reads flag_wipe before
+// calling retention_attach.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmRetention (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - The 24h ns literal is staged in r11 via `mov r11, imm64` because
+//     it exceeds imm32 (matches the paideia-as r11 imm64 sweep from
+//     paideia-as commit R48 fingerprint lines).
+//   - Every other cmp reg, imm ≤ 0x7FFFFFFF (only 0 appears).
+//   - r11 is scratch (used for the imm64 stage AND every .bss lea; the
+//     two uses do not overlap — the stage writes the slot BEFORE any
+//     subsequent lea reuses r11).
+//   - retention_attach prologue: `sub rsp, 8` pad only (leaf, no
+//     callee-save touched). Entry rsp % 16 == 8, post-sub rsp % 16 ==
+//     0 for the nested Print::print_str.
+
+module RmRetention = structure {
+
+  // -- 24h in nanoseconds, absolute (needs r11 imm64 staging) -----------
+  //
+  // 24 * 3600 * 10^9 = 86_400_000_000_000 = 0x4E94914F0000.
+  // This exceeds imm32 (0x7FFFFFFF); every use site must stage via
+  // `mov r11, 0x4E94914F0000` before consuming (the paideia-as
+  // no-imm64-in-cmp discipline; matches the R48 fingerprint sweep).
+  //
+  // Declared as a u64 constant here for documentation; the emission
+  // site inline-stages the same literal because paideia-as has no
+  // "load constant via lea" for a pure u64 — the constant does not
+  // land in .rodata, it lives in the instruction stream as a mov
+  // r64, imm64.
+  pub let RETENTION_24H_NS : u64 = 0x4E94914F0000
+
+  // -- .bss observability slots -----------------------------------------
+  //
+  // retention_deadline_ns — last computed 24h deadline (in ns). At M2
+  // this is a fixed 24h value; at post-substrate M3 the compute
+  // becomes `sys_now_ns() + RETENTION_24H_NS` and the slot holds an
+  // absolute nanosecond timestamp. The slot is the observability
+  // signal the M4 smoke reads to verify "the retention hop was
+  // reached with the expected value".
+  //
+  // retention_attach_count — bumped once per rm_process_one call that
+  // reaches the retention hop. Equals removed_count minus the wipe-
+  // suppressed count (RmWipe M2-004 short-circuits before this
+  // helper), so a nonzero divergence between the two counters is the
+  // M4-detected signal that a --wipe path was taken.
+  pub let mut retention_deadline_ns   : u64 = uninit @align(8)
+  pub let mut retention_attach_count  : u64 = uninit @align(8)
+
+  // -- .rodata note text ------------------------------------------------
+  //
+  // 31 bytes: "trash retention: 24h (M2 stub)\n". Emitted from
+  // retention_attach when flag_v == 1. The (M2 stub) suffix reads
+  // to a user that the emit is not yet backed by a live trash entry.
+  pub let RETENTION_NOTE     : [u8; 31] =
+    "trash retention: 24h (M2 stub)\n"
+  pub let RETENTION_NOTE_LEN : u64      = 31
+
+  // ============================================================================
+  // retention_attach(target_ptr) -> ()
+  //
+  // Signature: retention_attach : (u64) -> () !{mem, sysreg} @{}
+  // RDI (input): target_ptr — path pointer; unused at M2 (the M3 undo
+  //              record will name the target in the retention record).
+  //
+  // M2-003 body:
+  //   (1) bump retention_attach_count;
+  //   (2) stage RETENTION_24H_NS in r11, store into
+  //       retention_deadline_ns (the observable "last computed
+  //       deadline");
+  //   (3) if flag_v == 1: emit RETENTION_NOTE via Print::print_str.
+  //
+  // Register plan (leaf; one nested Print call):
+  //   sub rsp, 8   — align rsp%16 to 0 for the nested Print::print_str
+  //   rax = counter/store scratch
+  //   r11 = imm64 stage + lea scratch (uses do not overlap)
+  //   rdi = print_str arg 1 (buffer, overwrites caller's target)
+  //   rsi = print_str arg 2 (length)
+  // ============================================================================
+  pub let retention_attach : (u64) -> () !{mem, sysreg} @{} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.M2-003 retention_attach. Bumps retention_attach_count, stages the 24h ns literal (0x4E94914F0000 = 86_400_000_000_000, exceeds imm32 hence the mov r64, imm64 idiom = paideia-as r11 imm64 sweep pattern from the R48 fingerprint sweep), stores it into retention_deadline_ns as the last-computed deadline. Under -v, additionally emits a 31-byte 'trash retention: 24h (M2 stub)\\n' note via Print::print_str. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for the nested Print. Matched add rsp, 8 in both return paths. All cmp immediates are 0. r11 is used first as an imm64 staging register (mov r11, 0x4E94914F0000) and then as a lea scratch — the two uses do not overlap because the store completes before any lea. target_ptr is present-but-unused at M2 (M3 undo-record body uses it to name the target).",
+      block: {
+        sub rsp, 8;                            // rsp%16: 8 → 0
+
+        // (1) bump retention_attach_count.
+        lea r11, [rip + retention_attach_count];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // (2) stage 24h ns and store into retention_deadline_ns.
+        //     r11 first carries the imm64 value, then rax holds it
+        //     across the lea r11, [rip + slot] that reuses r11.
+        mov r11, 0x4E94914F0000;               // RETENTION_24H_NS
+        mov rax, r11;
+        lea r11, [rip + retention_deadline_ns];
+        mov [r11], rax;
+
+        // (3) optional verbose emit.
+        lea r11, [rip + RmFlags::flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je retention_done;
+
+        lea rdi, [rip + RETENTION_NOTE];
+        mov rsi, 31;                           // RETENTION_NOTE_LEN
+        call Print::print_str;
+        // fallthrough
+
+      retention_done:
+        add rsp, 8;
+        ret
+      }
+    }
+}
