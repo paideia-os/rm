@@ -86,12 +86,21 @@ module Retention = structure {
 
   // -- .rodata note text ------------------------------------------------
   //
-  // 31 bytes: "trash retention: 24h (M2 stub)\n". Emitted from
+  // 35 bytes: "rm: trash retention: 24h (M2 stub)\n". Emitted from
   // retention_attach when flag_v == 1. The (M2 stub) suffix reads
   // to a user that the emit is not yet backed by a live trash entry.
-  pub let RETENTION_NOTE     : [u8; 31] =
-    "trash retention: 24h (M2 stub)\n"
-  pub let RETENTION_NOTE_LEN : u64      = 31
+  //
+  // rm.ENH-006 (issue #23): carries its own "rm: " prefix so this call
+  // emits a complete, self-contained line. Before this fix the note had
+  // no prefix and printed with no terminator on either side, so it
+  // fused directly onto RmRemove::rm_process_one's still-open target
+  // line (the "rm: report.txttrash retention: ..." interleaving bug).
+  // RmRemove::rm_process_one now closes the target line with a
+  // newline before calling retention_attach when flag_v == 1, so this
+  // note stands as its own line rather than continuing another one.
+  pub let RETENTION_NOTE     : [u8; 35] =
+    "rm: trash retention: 24h (M2 stub)\n"
+  pub let RETENTION_NOTE_LEN : u64      = 35
 
   // ============================================================================
   // retention_attach(target_ptr) -> ()
@@ -117,7 +126,7 @@ module Retention = structure {
   pub let retention_attach : (u64) -> () !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M2-003 retention_attach. Bumps retention_attach_count, stages the 24h ns literal (0x4E94914F0000 = 86_400_000_000_000, exceeds imm32 hence the mov r64, imm64 idiom = paideia-as r11 imm64 sweep pattern from the R48 fingerprint sweep), stores it into retention_deadline_ns as the last-computed deadline. Under -v, additionally emits a 31-byte 'trash retention: 24h (M2 stub)\\n' note via Print::print_str. Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for the nested Print. Matched add rsp, 8 in both return paths. All cmp immediates are 0. r11 is used first as an imm64 staging register (mov r11, 0x4E94914F0000) and then as a lea scratch — the two uses do not overlap because the store completes before any lea. target_ptr is present-but-unused at M2 (M3 undo-record body uses it to name the target).",
+      justification: "rm.M2-003 retention_attach. Bumps retention_attach_count, stages the 24h ns literal (0x4E94914F0000 = 86_400_000_000_000, exceeds imm32 hence the mov r64, imm64 idiom = paideia-as r11 imm64 sweep pattern from the R48 fingerprint sweep), stores it into retention_deadline_ns as the last-computed deadline. Under -v, additionally emits a 35-byte 'rm: trash retention: 24h (M2 stub)\\n' note via Print::print_str (rm.ENH-006/#23: the note now carries its own 'rm: ' prefix so it is a complete, self-contained line rather than fusing onto the caller's still-open target line). Prologue: sub rsp, 8 = 8 bytes; entry rsp % 16 == 8, post-sub rsp % 16 == 0 for the nested Print. Matched add rsp, 8 in both return paths. All cmp immediates are 0. r11 is used first as an imm64 staging register (mov r11, 0x4E94914F0000) and then as a lea scratch — the two uses do not overlap because the store completes before any lea. target_ptr is present-but-unused at M2 (M3 undo-record body uses it to name the target).",
       block: {
         sub rsp, 8;                            // rsp%16: 8 → 0
 
@@ -142,7 +151,7 @@ module Retention = structure {
         je retention_done;
 
         lea rdi, [rip + RETENTION_NOTE];
-        mov rsi, 31;                           // RETENTION_NOTE_LEN
+        mov rsi, 35;                           // RETENTION_NOTE_LEN
         call print_str;
         // fallthrough
 

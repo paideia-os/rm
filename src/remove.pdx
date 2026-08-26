@@ -119,11 +119,26 @@ module Remove = structure {
   pub let NEWLINE_LEN        : u64       = 1
 
   // M2-scope stub suffix. Emitted from rm_process_one when
-  // flag_dry_run == 0 (the default). Names the M2 substrate gap so a
-  // user reading stdout sees exactly which kernel op is still missing.
+  // flag_dry_run == 0 (the default) AND flag_v == 0. Names the M2
+  // substrate gap so a user reading stdout sees exactly which kernel
+  // op is still missing. The leading ':' is deliberate under -v == 0:
+  // Part 3 leaves the target line open (no terminator) so this suffix
+  // continues it in one line: "<target>: (M2 stub ...)".
   pub let M2_STUB_SUFFIX     : [u8; 61]  =
     ": (M2 stub -- real trash-move lands with PdxFS mutating ops)\n"
   pub let M2_STUB_SUFFIX_LEN : u64       = 61
+
+  // rm.ENH-006 (issue #23): verbose variant of M2_STUB_SUFFIX. Under
+  // -v, Part 3 now closes the "rm: <target>" line with its own
+  // newline (so retention_attach's note prints as a second complete
+  // "rm: ..." line rather than fusing into an open one — see the
+  // interleaving bug this issue fixes). This suffix must therefore
+  // stand as its own complete line too, so it gets its own "rm: "
+  // prefix instead of the bare leading ':' the non-verbose form uses.
+  // 63 bytes.
+  pub let M2_STUB_SUFFIX_VERBOSE     : [u8; 63]  =
+    "rm: (M2 stub -- real trash-move lands with PdxFS mutating ops)\n"
+  pub let M2_STUB_SUFFIX_VERBOSE_LEN : u64       = 63
 
   // M2-002: emitted from confirm_check when flag_v == 1 AND flag_f == 1.
   // 26 bytes: "-f: skipping confirmation\n".
@@ -566,6 +581,25 @@ module Remove = structure {
         jmp rm_process_done_ok;
 
       rm_process_print_m2_suffix:
+        // ---- rm.ENH-006 (issue #23): close the "rm: <target>" line -----
+        // before any interposed hook prints. Under -v, retention_attach
+        // below emits its OWN complete "rm: trash retention: ..." line;
+        // without this newline that note fused directly onto Part 3's
+        // unterminated target bytes (the reported "rm: report.txttrash
+        // retention: ..." garble). Under non-verbose, retention_attach
+        // emits nothing, so the target line is deliberately left open
+        // here — M2_STUB_SUFFIX's leading ':' closes it below in one
+        // line, unchanged from the pre-fix behaviour.
+        lea r11, [rip + flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_process_m2_suffix_retention;
+
+        lea rdi, [rip + NEWLINE];
+        mov rsi, 1;                            // NEWLINE_LEN
+        call print_str;
+
+      rm_process_m2_suffix_retention:
         // ---- M2-003: retention attach (populates retention_deadline_ns
         //              which RmUndo::undo_write snapshots below) -------
         mov rdi, rbx;                          // arg = target_ptr
@@ -590,9 +624,25 @@ module Remove = structure {
         mov rdi, rbx;
         call audit_record_target;
 
-        // ---- M2 stub suffix (visual: names the substrate gap) -----------
+        // ---- M2 stub suffix (visual: names the substrate gap). Verbose
+        //      gets its own complete "rm: ..." line (Part 3's target
+        //      line and retention's note line are already closed above);
+        //      non-verbose keeps the colon-continuation form that closes
+        //      Part 3's still-open target line in a single line. -------
+        lea r11, [rip + flag_v];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_process_m2_suffix_plain;
+
+        lea rdi, [rip + M2_STUB_SUFFIX_VERBOSE];
+        mov rsi, 63;                           // M2_STUB_SUFFIX_VERBOSE_LEN
+        jmp rm_process_m2_suffix_print;
+
+      rm_process_m2_suffix_plain:
         lea rdi, [rip + M2_STUB_SUFFIX];
         mov rsi, 61;                           // M2_STUB_SUFFIX_LEN
+
+      rm_process_m2_suffix_print:
         call print_str;
         // fallthrough
 
