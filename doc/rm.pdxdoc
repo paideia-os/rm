@@ -55,9 +55,14 @@
   * `rm` never prompts on a read-only file. Cap-check for
     KIND_PDXFS_FILE(write,<target-parent>) is the sole authority.
 
-  * `rm -rf /` is not distinguished by pattern — the cap-check on
-    the root subtree denies the write and rm exits 4. There is no
-    heuristic hard-code of "/", "/*", or a similar list.
+  * `rm -rf /` never reaches a cap-check: `-rf` is a clustered short
+    flag and libpdx-argv rejects clustering outright (`ERR_CLUSTERED_
+    SHORT`), exiting 2 before rm's body ever runs. Typed as `rm -r -f
+    /`, the target IS distinguished — not by a heuristic hard-code of
+    "/", "/*", or a similar list, but because the loader's cap_
+    manifest_verify (libpdx-cap M2-001) denies the write at exec time
+    if the root subtree is outside rm's narrowed KIND_PDXFS_FILE
+    scope; rm's own body never observes or returns that denial.
 
   * Every removal is undoable within the retention window. POSIX rm
     is destructive-on-return; Paideia rm returns before the trash
@@ -82,10 +87,15 @@
 @exit-codes
   0  Success (every target processed).
   1  At least one target failed against the substrate.
-  2  Usage error (bad flag, missing positional).
-  3  System error (I/O, kernel refused, TXN aborted).
-  4  Capability denied (target-parent write cap missing, or a
-     --no-cap:… stripped the cap the request needs).
+  2  Usage error (bad flag, missing positional; also a clustered
+     short flag such as `-rf`, which libpdx-argv rejects outright).
+  3  EXIT_NOT_YET_IMPL — reserved for a flag combination an M2+ body
+     recognises but does not yet implement. Not returned by any path
+     at this release.
+  4  Capability denied. Raised by the loader's cap_manifest_verify at
+     exec time (target-parent write cap missing, or a --no-cap:…
+     stripped the cap the request needs) — a cap-denied process never
+     starts, so rm's own body never observes or returns this code.
   5  Signature verification failure (raised by pkg during install,
      never by rm at run-time).
 

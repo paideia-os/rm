@@ -81,11 +81,13 @@ breakdown.
   `_elevate_req_buf` + `_elevate_reply_buf`. ELVC_STUB (0xFFFFEA00,
   staged via `mov r10, imm64` per imm64 sweep) and ELVC_OK both
   proceed; any other rc blocks the removal (bumps
-  `rm_blocked_by_elevate`, EXIT_OK preserved at M3). Runs FIRST in
+  `rm_blocked_by_elevate`, EXIT_OK preserved at M3). Ran FIRST in
   `rm_process_one` — no observable action if refused.
-  `walk_blocked_by_elevate` counter added for the walk-branch
-  top-level target (walk-per-entry hook lands with the substrate
-  transition).
+  `walk_blocked_by_elevate` counter was added at M3-004 but nothing
+  wrote it: the `src/walk.pdx` extension landed only the counter
+  declaration, not a call into `elevate_check_and_request` from the
+  `-r` branch, so `rm -r /system/...` bypassed the gate entirely
+  until the enhancement-v1.x pass closed issue #18 (see below).
 
 ## M4 — tests + smoke (complete)
 
@@ -199,6 +201,37 @@ breakdown.
   gap that keeps the release `author-signed-only` until
   T-INFRA-001/002 land. STATUS.md rolls up to LANDED for both M5
   issues; the git tag `v1.0.0` marks the release commit.
+
+## Enhancement v1.x (in progress, 2026-08-25)
+
+Findings from `design/enhancement-plan.md`; issues #18-#27 (milestone
+"Enhancement v1.x — rm"). See that document for full analysis.
+
+- `src/remove.pdx` + `src/walk.pdx` (issue #18, ENH-001, SECURITY):
+  the `/system/` elevate gate is now a single call in
+  `rm_remove_body`'s dispatch loop, before the `flag_r` branch, so it
+  covers `walk_recursive` (`-r`) and `rm_process_one` identically.
+  Previously the gate lived only inside `rm_process_one` and `-r`
+  bypassed it entirely. `rm_blocked_by_elevate` / `walk_blocked_by_
+  elevate` are now bumped from the shared call site.
+- `src/remove.pdx` + `src/retention.pdx` (issue #23, ENH-006): fixed
+  the verbose-output interleaving bug (`rm: report.txttrash
+  retention: ...`). Under `-v`, the target line is now closed with a
+  newline before `retention_attach` runs; `RETENTION_NOTE` carries its
+  own `rm: ` prefix; `M2_STUB_SUFFIX` has a verbose variant that is
+  its own complete line instead of continuing an already-closed one.
+- `src/flags.pdx` (issue #26, ENH-008): `--recursive`, `--force`,
+  `--verbose` now work as documented long aliases of `-r`/`-f`/`-v`.
+- `doc/rm.pdxdoc` + `STATUS.md` (issue #27, ENH-009, this entry):
+  corrected the `rm -rf /` exit-code claim (clustered short flags are
+  rejected by libpdx-argv at exit 2, never reaching a cap-check), the
+  exit-code table (3 = `EXIT_NOT_YET_IMPL`, reserved; 4 is a
+  loader-side exec-time denial rm's own body never returns), and the
+  M3-004 entry above.
+- Not landed this pass: #19 (elevate gate matches unresolved argv
+  bytes — blocked on a shared path-canonicalisation library and a
+  loader-narrowing answer neither of which exist yet; see issue #19
+  and enhancement-plan.md §11 items 1-2), #20, #21, #22, #24, #25.
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

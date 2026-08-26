@@ -129,10 +129,27 @@ module Schema = structure {
   //                            returns.
   // record_emit_err_count    = number of non-SP_OK Send::send_record
   //                            returns; sum with record_emit_count
-  //                            equals the number of record_emit calls,
-  //                            equals removed_count minus wipe_count
-  //                            (wipe path does emit a record — see
-  //                            §Interaction below).
+  //                            equals the number of record_emit calls
+  //                            from RmRemove::rm_process_one (issue
+  //                            #27 errata: an earlier version of this
+  //                            comment said the sum equals removed_
+  //                            count minus wipe_count, which is
+  //                            self-contradictory — the --wipe branch
+  //                            DOES call record_emit, same as the
+  //                            default branch; only --dry-run skips
+  //                            it. The correct relation: when flag_
+  //                            dry_run == 0, the sum equals removed_
+  //                            count (both the default and --wipe
+  //                            branches call record_emit exactly
+  //                            once before bumping removed_count);
+  //                            when flag_dry_run == 1 the sum is 0
+  //                            regardless of removed_count, since
+  //                            rm_process_one's dry-run branch never
+  //                            calls record_emit. removed_count only
+  //                            counts targets dispatched to rm_
+  //                            process_one — RmWalk::walk_recursive
+  //                            (the -r branch) never calls record_
+  //                            emit at all (issue #22, not yet fixed).
   pub let mut _record_scratch      : [u64; 5] = uninit @align(8)
   pub let mut schema_bind_ok       : u64      = uninit @align(8)
   pub let mut schema_bind_attempts : u64      = uninit @align(8)
