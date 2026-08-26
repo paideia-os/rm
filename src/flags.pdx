@@ -21,6 +21,18 @@
 // this module scheduled for M4 (test invariant "unknown flag → exit
 // 2") and does not require a signature change on flags_scan.
 //
+// rm.ENH-008 (issue #26): -r, -f, and -v also accept their long forms
+// (--recursive, --force, --verbose respectively) — doc/rm.pdxdoc has
+// documented all three since 1.0.0 but the source never implemented
+// them, so a user following `doc rm` got a silent no-op instead of
+// the documented behaviour (worst case: `rm --recursive stale/`
+// silently performed a NON-recursive removal). The first-byte switch
+// is unchanged (the long forms share their short form's first byte);
+// each of flags_try_r/f/v now nests a second-byte branch: NUL at
+// [rdx+1] is the short form, otherwise the remaining bytes are
+// checked against the long form's tail + NUL. --wipe and --dry-run
+// already had no short form to collide with, so they are unaffected.
+//
 // Every rm flag is boolean at M1 — the value-pointer is ignored
 // even when libpdx-argv's lookahead absorbed a positional as the
 // flag's value. Downstream milestones do NOT add value-taking flags
@@ -131,7 +143,7 @@ module Flags = structure {
   pub let flags_scan : () -> () !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "rm.M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d' (distinct across the M1 vocabulary); per-branch inline byte-compare with #1248-mitigated byte loads. Unknown flags fall through silently at M1 (documented in design/argv-surface.md; enforcement lands at M4 as a body edit returning a u64 error code). All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
+      justification: "rm.ENH-008 (issue #26), extends M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d' (distinct across the M1 vocabulary); per-branch inline byte-compare with #1248-mitigated byte loads. flags_try_r/f/v each nest a second-byte branch: NUL at [rdx+1] matches the short form (flags_try_{r,f,v}_short); otherwise the tail is compared against the long alias ('ecursive'/'orce'/'erbose' + NUL) so --recursive/--force/--verbose set the same boolean slot as their short form. Unknown flags (including a mismatched long-form tail) fall through silently at M1 (documented in design/argv-surface.md; enforcement lands at M4 as a body edit returning a u64 error code). All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
       block: {
         xor r8, r8;                              // i = 0
         lea r11, [rip + flag_count];
@@ -159,34 +171,72 @@ module Flags = structure {
         je flags_try_dry_run;
         jmp flags_advance;                       // unknown → silently ignored at M1
 
-      // ---- -r: NUL at [rdx+1] ----
+      // ---- -r (NUL at [rdx+1]) OR --recursive ('r' + "ecursive" + NUL) ----
+      // rm.ENH-008 (issue #26): the doc has always documented `-r,
+      // --recursive` (doc/rm.pdxdoc); the long form did not exist in
+      // source until this fix. Nested second-byte compare per the
+      // obstacle argv-surface.md §61-68 already named: a match on the
+      // short form's NUL falls to flags_try_r_short below; anything
+      // else is checked against "ecursive" + NUL before giving up.
       flags_try_r:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
+        je flags_try_r_short;
+        cmp rax, 0x65;                           // 'e' (--recursive)
         jne flags_advance;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x63; jne flags_advance;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x75; jne flags_advance;  // 'u'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_advance;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x69; jne flags_advance;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0x76; jne flags_advance;  // 'v'
+        xor rax, rax; mov_b rax, [rdx + 8]; cmp rax, 0x65; jne flags_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 9]; cmp rax, 0;    jne flags_advance;  // NUL
+
+      flags_try_r_short:
         mov rax, 1;
         lea r11, [rip + flag_r];
         mov [r11], rax;
         jmp flags_advance;
 
-      // ---- -f: NUL at [rdx+1] ----
+      // ---- -f (NUL at [rdx+1]) OR --force ('f' + "orce" + NUL) ----------
+      // rm.ENH-008 (issue #26): see flags_try_r above for the pattern.
       flags_try_f:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
+        je flags_try_f_short;
+        cmp rax, 0x6F;                           // 'o' (--force)
         jne flags_advance;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x63; jne flags_advance;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x65; jne flags_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0;    jne flags_advance;  // NUL
+
+      flags_try_f_short:
         mov rax, 1;
         lea r11, [rip + flag_f];
         mov [r11], rax;
         jmp flags_advance;
 
-      // ---- -v: NUL at [rdx+1] ----
+      // ---- -v (NUL at [rdx+1]) OR --verbose ('v' + "erbose" + NUL) ------
+      // rm.ENH-008 (issue #26): see flags_try_r above for the pattern.
       flags_try_v:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
+        je flags_try_v_short;
+        cmp rax, 0x65;                           // 'e' (--verbose)
         jne flags_advance;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_advance;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x62; jne flags_advance;  // 'b'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x6F; jne flags_advance;  // 'o'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_advance;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x65; jne flags_advance;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_advance;  // NUL
+
+      flags_try_v_short:
         mov rax, 1;
         lea r11, [rip + flag_v];
         mov [r11], rax;

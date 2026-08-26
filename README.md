@@ -60,16 +60,22 @@ default retention path.
 
 | Short | Long | Argument | Default | Description |
 |-------|------|----------|---------|-------------|
-| `-r` | — | none (boolean) | off | Recursive descent. `rm_remove_body` dispatches the target to `RmWalk::walk_recursive` instead of `rm_process_one`. The real leaf-first walk under one TXN lands with the PdxFS mutating ops; at this release the branch prints `recursive walk of: <target>` and bumps `walk_invocations`. **The `-r` branch does not perform the `/system/` elevate check** — that check lives only in the non-recursive path. |
-| `-f` | — | none (boolean) | off | Force. rm has no stdin binding at 1.0.0, so there is no confirmation prompt to skip and **both settings proceed with the removal**. `confirm_check` (`src/remove.pdx:246`) bumps `confirm_skips_by_f` when set and `confirm_prompts_stub` when unset; under `-v` it prints `-f: skipping confirmation` or `would prompt for confirmation (M2 stub)` respectively. The interactive prompt arrives with the shell's stdin plumbing. |
-| `-v` | — | none (boolean) | off | Verbose. Prepends `rm: ` to each target line and emits every decision the removal took: confirmation note, `trash retention: 24h (M2 stub)`, shred line. |
+| `-r` | `--recursive` | none (boolean) | off | Recursive descent. `rm_remove_body` dispatches the target to `RmWalk::walk_recursive` instead of `rm_process_one`. The real leaf-first walk under one TXN lands with the PdxFS mutating ops; at this release the branch prints `recursive walk of: <target>` and bumps `walk_invocations`. The `/system/` elevate check runs once per target in `rm_remove_body`, before dispatch, so it gates the `-r` branch identically to the non-recursive one (fixed by issue #18; previously the recursive branch bypassed it entirely). |
+| `-f` | `--force` | none (boolean) | off | Force. rm has no stdin binding at 1.0.0, so there is no confirmation prompt to skip and **both settings proceed with the removal**. `confirm_check` (`src/remove.pdx:246`) bumps `confirm_skips_by_f` when set and `confirm_prompts_stub` when unset; under `-v` it prints `-f: skipping confirmation` or `would prompt for confirmation (M2 stub)` respectively. The interactive prompt arrives with the shell's stdin plumbing. |
+| `-v` | `--verbose` | none (boolean) | off | Verbose. Prepends `rm: ` to each target line and emits every decision the removal took: confirmation note, `rm: trash retention: 24h (M2 stub)`, shred line — each as its own complete, self-prefixed line (fixed by issue #23; previously the retention note fused into the unterminated target line). |
 | — | `--wipe` | none (boolean) | off | Forensic shred. Skips the trash-subtree journal, skips retention, and **skips the undo record entirely** — a `--wipe` removal is by design irreversible. Sets `RmWipe::was_wiped_flag = 1` and bumps `wipe_count`; still emits its `RemoveRecord` and its audit record. Loses to `--dry-run`. |
 | — | `--dry-run` | none (boolean) | off | Print what would happen and return 0. Zero side effects on the filesystem, the audit output stream, the schema stream, and the undo log — the dry-run branch takes **none** of the four M3 hooks. `--dry-run` outranks `--wipe`, so `rm --wipe --dry-run x` prints the ordinary `would remove:` line and emits no shred stub. |
 
-There are no long aliases: `--recursive`, `--force`, and `--verbose` are **not**
-recognised. `RmFlags::flags_scan` (`src/flags.pdx:131`) matches exactly the five
-names `r`, `f`, `v`, `wipe`, `dry-run` via a first-byte switch, and an unrecognised
-flag currently falls through **silently** rather than failing with a usage error.
+`--recursive`, `--force`, and `--verbose` are recognised as long aliases of
+`-r`, `-f`, `-v` respectively (issue #26; doc/rm.pdxdoc has documented all
+three since 1.0.0, but the source did not implement them until this fix).
+`RmFlags::flags_scan` (`src/flags.pdx`) still switches on first byte
+(`r`/`f`/`v`/`w`/`d`) and now nests a second-byte check per branch: a NUL
+right after the first byte is the short form, otherwise the remaining bytes
+are matched against the long form's tail. An unrecognised flag (including a
+long-form tail that doesn't match) still falls through **silently** rather
+than failing with a usage error — that rejection contract remains open
+(issue #25).
 
 ## Exit codes
 
@@ -130,15 +136,16 @@ wipe_emit                  : (u64) -> ()            !{mem, sysreg} @{}
 
 ## Examples
 
-Remove one file, verbose. Note that `retention_attach` prints its note
-immediately after the target bytes and before the trailing suffix, so the
-verbose line reads as three concatenated fragments:
+Remove one file, verbose. Each hook now emits its own complete,
+self-prefixed line (issue #23 fixed the interleaving bug that used to fuse
+`retention_attach`'s note into the still-open target line):
 
 ```
 $ rm -v report.txt
 would prompt for confirmation (M2 stub)
-rm: report.txttrash retention: 24h (M2 stub)
-: (M2 stub -- real trash-move lands with PdxFS mutating ops)
+rm: report.txt
+rm: trash retention: 24h (M2 stub)
+rm: (M2 stub -- real trash-move lands with PdxFS mutating ops)
 ```
 
 Preview without touching anything. The dry-run branch takes none of the
@@ -169,8 +176,10 @@ rm: recursive walk of: stale/: (M2 stub -- real walk lands with PdxFS mutating o
 
 A target under `/system/` requests elevation. rm lodges a per-operation
 elevate request and, if the broker refuses, skips the removal entirely and
-bumps `rm_blocked_by_elevate` — nothing is printed, nothing is audited,
-nothing is journaled, and the exit code stays 0 at this release:
+bumps `rm_blocked_by_elevate` (or `walk_blocked_by_elevate` under `-r`,
+since issue #18 the gate runs once in `rm_remove_body` before dispatch and
+covers both branches) — nothing is printed, nothing is audited, nothing is
+journaled, and the exit code stays 0 at this release:
 
 ```
 $ rm -v /system/audit/user-events/2026-08.log
