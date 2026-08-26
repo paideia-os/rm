@@ -331,7 +331,7 @@ module Remove = structure {
   pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M2-001 rm_remove_body. Iterates ParsedArgs::pos_ptrs[0..pos_count] and dispatches per-target on flag_r. The M1-era rdi=target_ptr argument is ignored (RmMain::rm_main still passes pos_ptrs[0] out of signature-compat with M1; the M2 body reads pos_ptrs itself so every positional beyond the first is also processed). 2-push prologue (r12=i, r13=pos_count) + sub rsp, 8 pad keeps rsp%16 == 0 at every nested call site (dispatch to rm_process_one or RmWalk::walk_recursive). r12 + r13 preserved across each dispatch by the SysV callee-save contract; both callees respect it (rm_process_one uses only rbx; walk_recursive uses only rbx). All immediates in cmp are 0 or the pos_count bound (32, fits imm32 trivially). Every .bss read via lea r11, [rip + sym]. Return: pop pad, pop r13, pop r12, xor rax,rax, ret — exit code always EXIT_OK at M2-001 because the mutating substrate is not in-tree.",
+      justification: "rm.ENH-001 (issue #18) rm_remove_body. Iterates ParsedArgs::pos_ptrs[0..pos_count] and dispatches per-target on flag_r. The M1-era rdi=target_ptr argument is ignored (RmMain::rm_main still passes pos_ptrs[0] out of signature-compat with M1; the M2 body reads pos_ptrs itself so every positional beyond the first is also processed). SECURITY FIX #18: RmElevate::elevate_check_and_request now runs HERE, once per target, BEFORE the flag_r branch -- the single point where every target is in hand and no dispatch decision has been taken yet. This closes the -r bypass: previously the gate lived only inside rm_process_one, so RmWalk::walk_recursive (the flag_r==1 arm) never saw it. A refusal (rax != 0) skips dispatch entirely (no walk_recursive call, no rm_process_one call -- no print, no retention, no undo, no schema, no audit) and bumps the counter matching the arm that would have run (walk_blocked_by_elevate for flag_r==1, rm_blocked_by_elevate for flag_r==0) so the observability split from M3-004 is preserved. The call clobbers rdi (caller-saved), so pos_ptrs[i] is reloaded into rdi immediately after for the actual dispatch. 2-push prologue (r12=i, r13=pos_count) + sub rsp, 8 pad keeps rsp%16 == 0 at every nested call site (elevate_check_and_request, rm_process_one, RmWalk::walk_recursive). r12 + r13 preserved across each call by the SysV callee-save contract; elevate_check_and_request touches only rbx/rcx/r8/r9/r10/r11/rax, rm_process_one only rbx/r12(own frame), walk_recursive only rbx -- none touch the caller's r12/r13. All immediates in cmp are 0 or the pos_count bound (32, fits imm32 trivially). Every .bss read via lea r11, [rip + sym]. Return: pop pad, pop r13, pop r12, xor rax,rax, ret — exit code always EXIT_OK at M2-001 because the mutating substrate is not in-tree.",
       block: {
         // Prologue: preserve iteration state; align stack for nested calls.
         push r12;                              // rsp%16: 8 → 0
@@ -348,7 +348,17 @@ module Remove = structure {
         cmp r12, r13;
         jge rm_remove_loop_done;
 
-        // Load pos_ptrs[i] into rdi (dispatch arg).
+        // Load pos_ptrs[i] into rdi (elevate-check arg).
+        lea r11, [rip + pos_ptrs];
+        mov rdi, [r11 + r12*8];
+
+        // ---- SECURITY (#18): single-site elevate gate, BEFORE the
+        //      flag_r dispatch decision. Covers both arms. ----------------
+        call elevate_check_and_request;
+        cmp rax, 0;                            // RE_PROCEED (0)
+        jne rm_remove_blocked;
+
+        // Reload pos_ptrs[i] into rdi — the elevate call clobbered it.
         lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + r12*8];
 
@@ -365,6 +375,27 @@ module Remove = structure {
       rm_remove_call_process_one:
         // Non-recursive branch. rm_process_one(target) → rax=0 at M2.
         call rm_process_one;
+        jmp rm_remove_loop_advance;
+
+      rm_remove_blocked:
+        // Elevate refused: skip dispatch entirely. Bump the counter that
+        // matches the arm this target would have taken.
+        lea r11, [rip + flag_r];
+        mov rax, [r11];
+        cmp rax, 0;
+        je rm_remove_blocked_nonrecursive;
+
+        lea r11, [rip + walk_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp rm_remove_loop_advance;
+
+      rm_remove_blocked_nonrecursive:
+        lea r11, [rip + rm_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
 
       rm_remove_loop_advance:
         add r12, 1;
@@ -417,11 +448,22 @@ module Remove = structure {
   //          wipe_mark replace the retention emit + M2-stub suffix
   //          (a shred does not create a trash-subtree entry, so no
   //          retention applies; the audit flag is set for M3-002).
+  //   ENH-001 (#18) removed the elevate check that used to run first
+  //          in this body — it now runs once in RmRemove::rm_remove_
+  //          body's loop, before dispatch, covering both the
+  //          recursive and non-recursive arms.
+  //   ENH-006 (#23) fixed a verbose-output interleaving bug: under -v
+  //          this body now closes the "rm: <target>" line with a
+  //          newline before calling retention_attach, whose note is
+  //          now its own prefixed "rm: ..." line; the trailing M2
+  //          stub suffix has a verbose variant (own "rm: ..." line)
+  //          and the original non-verbose variant (colon-continuation
+  //          of the still-open target line), selected on flag_v.
   // ============================================================================
   pub let rm_process_one : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M3-004 rm_process_one (extended through M3-003). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. (M3-004) RmElevate::elevate_check_and_request runs FIRST — a /system/-prefixed target that libpdx-elevate refuses skips the entire remove (bumps rm_blocked_by_elevate, epilogue to EXIT_OK with no side effects; the M4 wire-up will raise this to EXIT_OP_FAIL once a smoke harness guarantees broker availability). (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then the M3 hooks fire (RmSchema::record_emit + RmAudit::audit_record_target — NO undo, wipe leaves no trash entry so no reversal exists; this is the load-bearing forensic-detection invariant from design/argv-surface.md §3.1). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hooks (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints the four M3 hops (retention_attach + undo_write + record_emit + audit_record_target) + M2_STUB_SUFFIX. undo_write runs AFTER retention_attach because undo_write snapshots RmRetention::retention_deadline_ns which retention_attach populates. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site (elevate_check_and_request, confirm_check, wipe_emit, four Print::print_str, retention_attach, undo_write, record_emit, audit_record_target). rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 61 fit imm32. Effect tail !{mem, sysreg} @{cap, sched} covers the audit + semantic-pipe + elevate call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
+      justification: "rm.ENH-001 (issue #18) rm_process_one (extended through M3-003). Flow: (target_len) NUL-walk stashed in r12 up-front so every M3 hook has the length available. The elevate gate that used to run first in THIS function has moved to RmRemove::rm_remove_body's loop (single call site covering both the recursive and non-recursive dispatch arms — see #18); by the time rm_process_one is entered the target has already been cleared to proceed, so this body no longer calls elevate_check_and_request nor owns rm_blocked_by_elevate's bump. (M2-002) confirm_check bumps skip/prompt counters. Dispatch priority (design/argv-surface.md §3.2): dry-run > wipe > default. (M2-004) --wipe branch: RmWipe::wipe_emit handles the four-part shred line + audit-flag set + counter bump, then the M3 hooks fire (RmSchema::record_emit + RmAudit::audit_record_target — NO undo, wipe leaves no trash entry so no reversal exists; this is the load-bearing forensic-detection invariant from design/argv-surface.md §3.1). Default branch: Part 1 (verbose) + Part 2 (dry-run prefix) + Part 3 (target); Part 4 dispatches on dry-run — dry-run prints '\\n' with NO M3 hooks (dry-run is by design non-emitting; the M3 record set describes real removals only); default prints the four M3 hops (retention_attach + undo_write + record_emit + audit_record_target) + M2_STUB_SUFFIX. undo_write runs AFTER retention_attach because undo_write snapshots RmRetention::retention_deadline_ns which retention_attach populates. 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad = 24 bytes; entry rsp % 16 == 8 → 8 + 24 = 32 → 32 % 16 == 0 for every nested call site (confirm_check, wipe_emit, Print::print_str, retention_attach, undo_write, record_emit, audit_record_target). rbx + r12 preserved across every nested call by SysV callee-save. Every .bss / .rodata read via lea r11, [rip + sym]. Byte reads via xor rax, rax; mov_b rax, [ptr] (#1248 mitigation) in the NUL-walk. All immediates ≤ 63 fit imm32. Effect tail !{mem, sysreg} @{cap, sched} covers the audit + semantic-pipe call fanout. Return: undo pad, pop r12, pop rbx, xor rax,rax, ret — always EXIT_OK at M3.",
       block: {
         // Prologue: preserve target_ptr + target_len across every hook.
         push rbx;                              // rsp%16: 8 → 0
@@ -446,16 +488,6 @@ module Remove = structure {
       rm_process_len_done:
         mov r12, rdx;
         sub r12, rbx;                          // r12 = target_len
-
-        // ---- M3-004: elevate check (before any observable action) -------
-        // A refusal must produce no confirm hop, no print, no retention,
-        // no audit/schema/undo emission — the removal never happened
-        // from the caller's perspective. Bump rm_blocked_by_elevate so
-        // an operator inspecting the counter set can see the refusal.
-        mov rdi, rbx;
-        call elevate_check_and_request;
-        cmp rax, 0;                            // RE_PROCEED (0)
-        jne rm_process_blocked;
 
         // ---- M2-002: confirm gate (proceeds unconditionally at M2/M3) ---
         mov rdi, rbx;                          // arg = target_ptr
@@ -576,21 +608,6 @@ module Remove = structure {
         pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK
-        ret;
-
-      rm_process_blocked:
-        // ---- Elevate refused: skip the removal entirely -----------------
-        // No confirm, no print, no retention, no undo/schema/audit emit.
-        // Bump the blocked counter so an operator can see the refusal.
-        lea r11, [rip + rm_blocked_by_elevate];
-        mov rax, [r11];
-        add rax, 1;
-        mov [r11], rax;
-
-        add rsp, 8;
-        pop r12;
-        pop rbx;
-        xor rax, rax;                          // EXIT_OK at M3
         ret;
       }
     }

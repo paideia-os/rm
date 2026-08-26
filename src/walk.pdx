@@ -86,22 +86,20 @@ module Walk = structure {
   // pos_count if every positional was dispatched exactly once.
   pub let mut walk_invocations : u64 = uninit @align(8)
 
-  // -- M3-004 counter ---------------------------------------------------
-  // walk_blocked_by_elevate — bumped when RmElevate::elevate_check_and_
-  // request refuses at the walk-branch top-level target. The walk
-  // skips the print + M3 hooks; walk_invocations still counts the
-  // dispatch (so an operator can distinguish "walk dispatched then
-  // skipped by elevate" from "walk never entered"). Reset each rm
-  // invocation via RmRemove::remove_reset (M3 extension adds it to
-  // the umbrella reset list).
+  // -- ENH-001 (issue #18) counter ---------------------------------------
+  // walk_blocked_by_elevate — bumped by RmRemove::rm_remove_body when
+  // RmElevate::elevate_check_and_request refuses a target that would
+  // have dispatched to walk_recursive (flag_r == 1). The gate runs in
+  // the caller's loop, BEFORE walk_recursive is ever called, so a
+  // refusal here means this module's body never entered for that
+  // target at all: no print, no walk_invocations bump. Reset each rm
+  // invocation via RmRemove::remove_reset.
   //
-  // NOTE: this .bss slot is intentionally NOT zeroed in remove_reset
-  // at M3 to keep the umbrella reset's write-count bounded — the M4
-  // extension will add it alongside the wave of walk-per-entry
-  // counters the substrate transition introduces. At M3 an operator
-  // who re-runs rm in the same process (not a supported flow) reads
-  // a stale walk_blocked_by_elevate; the M4 smoke matrix documents
-  // this and the M4 remove_reset covers it.
+  // Prior to #18 this slot was declared, documented, reset, and never
+  // written — the M3-004 elevate wire-up covered only the non-
+  // recursive rm_process_one path, so `rm -r /system/...` bypassed the
+  // gate entirely. #18 fixes this by hoisting the check to the single
+  // dispatch point both arms share.
   pub let mut walk_blocked_by_elevate : u64 = uninit @align(8)
 
   // -- .rodata output pieces -------------------------------------------
