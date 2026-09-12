@@ -1,7 +1,9 @@
 # tests/
 
 M4 test corpus for `rm`. Each `m4_XXX_*.pdx` module lands one of the
-four M4 issues from paideia-os `design/tooling/r49-r50-plan.md` §5.8:
+four M4 issues from paideia-os `design/tooling/r49-r50-plan.md` §5.8
+plus the ENH-007 (issue #25) reject-unknown-flags contract landed by
+the enhancement-v1.x pass:
 
 | Issue                                                       | File                              | State  |
 |-------------------------------------------------------------|-----------------------------------|--------|
@@ -9,6 +11,7 @@ four M4 issues from paideia-os `design/tooling/r49-r50-plan.md` §5.8:
 | rm.M4-002 undo within retention window succeeds             | `m4_002_undo_in_window.pdx`       | LANDED |
 | rm.M4-003 undo after retention window: ENOENT-w/-diagnostic | `m4_003_undo_after_window.pdx`    | LANDED |
 | rm.M4-004 `--wipe` audit flag correctness                   | `m4_004_wipe_forensic.pdx`        | LANDED |
+| rm.ENH-007 (issue #25) reject unknown flags                 | `m4_005_unknown_flag_reject.pdx`  | LANDED |
 
 Plus a runner and a fingerprint corpus:
 

@@ -19,7 +19,7 @@
 # pkgs.paideia-os/main/).
 
 name          = rm
-version       = 1.0.0
+version       = 1.0.1
 kind          = tool
 entry         = RmMain::rm_main
 output        = build-out/rm

@@ -1,16 +1,17 @@
-// tests/m4_runner.pdx -- rm.M4 corpus runner
-// M4Runner module: aggregates the four M4Test00X entry points into
-// one deterministic run.
+// tests/m4_runner.pdx -- rm.M4 corpus runner (extended by ENH-007 #25)
+// M4Runner module: aggregates the M4Test00X entry points into one
+// deterministic run.
 //
 // Scope
 // -----
-// A single public entry, `m4_run_all`, invokes each of the four
-// M4-00X tests in issue-number order:
+// A single public entry, `m4_run_all`, invokes each M4-00X test in
+// issue-number order:
 //
 //   run_m4_001 -- TXN-abort mid-remove: no files removed
 //   run_m4_002 -- undo within retention window succeeds
 //   run_m4_003 -- undo after retention window: ENOENT-with-diagnostic
 //   run_m4_004 -- --wipe audit flag correctness (forensic detection)
+//   run_m4_005 -- ENH-007 (issue #25) unknown-flag reject contract
 //
 // Each test prints its own `[rm.M4-XXX OK]` or `[rm.M4-XXX FAIL]`
 // fingerprint on stdout before returning. The runner prints a
@@ -35,6 +36,7 @@
 //   [rm.M4-002 OK]      (or FAIL)
 //   [rm.M4-003 OK]      (or FAIL)
 //   [rm.M4-004 OK]      (or FAIL)
+//   [rm.M4-005 OK]      (or FAIL)     -- ENH-007 (issue #25)
 //   [rm.M4-runner done]
 //
 // The prologue + epilogue markers let the smoke driver bracket the
@@ -96,7 +98,7 @@ module M4Runner = structure {
   pub let m4_run_all : () -> u64 !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M4 runner. Prints [rm.M4-runner] prologue, invokes M4Test001::run_m4_001 through M4Test004::run_m4_004 in issue-number order, ORs each return code into rbx (0 for all-OK, 1 for any-fail), prints [rm.M4-runner done] epilogue, and returns rbx. Every test runs unconditionally -- a first-failure short-circuit would deprive the maintainer of the full failure matrix from one execution. 1-push prologue (rbx) preserves the accumulator across the six nested calls (two Print + four test runners); every callee uses SysV callee-save on rbx. Entry rsp%16 == 8, push brings it to 0 which satisfies alignment for every callee. r11 scratch only for the two lea + print sequences; the four test calls take no arguments and produce no register conflict. All immediates 0 or the two byte-lengths 15, 20 (fit imm32). Effect tail !{mem, sysreg} @{cap, sched} matches the strictest of the four tests (M4Test001 / M4Test004 declare @{cap, sched} via their rm_process_one calls).",
+      justification: "rm.M4 runner (extended by ENH-007 #25). Prints [rm.M4-runner] prologue, invokes M4Test001::run_m4_001 through M4Test005::run_m4_005 in issue-number order, ORs each return code into rbx (0 for all-OK, 1 for any-fail), prints [rm.M4-runner done] epilogue, and returns rbx. Every test runs unconditionally -- a first-failure short-circuit would deprive the maintainer of the full failure matrix from one execution. 1-push prologue (rbx) preserves the accumulator across the seven nested calls (two Print + five test runners); every callee uses SysV callee-save on rbx. Entry rsp%16 == 8, push brings it to 0 which satisfies alignment for every callee. r11 scratch only for the two lea + print sequences; the five test calls take no arguments and produce no register conflict. All immediates 0 or the two byte-lengths 15, 20 (fit imm32). Effect tail !{mem, sysreg} @{cap, sched} matches the strictest of the tests (M4Test001 / M4Test004 declare @{cap, sched} via their rm_process_one calls); M4Test005 declares the same !{mem, sysreg} @{cap, sched} for its remove_reset/flags_reset transitive tail.",
       block: {
         push rbx;                                // rsp%16: 8 -> 0
         xor rbx, rbx;                            // accumulator = 0
@@ -117,6 +119,9 @@ module M4Runner = structure {
         or rbx, rax;
 
         call run_m4_004;
+        or rbx, rax;
+
+        call run_m4_005;
         or rbx, rax;
 
         // (3) Epilogue fingerprint.

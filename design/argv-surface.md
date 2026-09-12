@@ -64,8 +64,13 @@ per-branch inline byte-compare (same idiom as libpdx-argv's
 `--pdx-schema` well-known check). Adding a sixth flag with a first
 byte already in {r,f,v,w,d} — e.g. `--force` — requires either a
 nested compare on the second byte inside the existing branch or an
-allocation from the remaining first-byte space. This will be
-documented as it happens; M1 has no such collision.
+allocation from the remaining first-byte space. ENH-008 (issue #26)
+took the nested-second-byte route inside the `r`/`f`/`v` arms to
+land `--recursive`/`--force`/`--verbose`; ENH-007 (issue #25) added
+a `p` arm to recognise the well-known D3 `--pdx-schema` flag
+(libpdx-argv's parser inline-toggles `ParsedArgs::emit_schema` for
+it; the `p` arm in rm does no local state change but keeps the name
+out of the ENH-007 unknown-flag rejection path).
 
 ### 3.1 Per-flag semantics
 
@@ -110,6 +115,20 @@ documented as it happens; M1 has no such collision.
 - `-f` composes with any other flag as a no-op at M1 and as
   "skip confirmation" at M2+.
 
+### 3.3 Unknown-flag rejection (ENH-007 / issue #25)
+
+`flags_scan` returns 0 on all-recognised or the interior name-pointer
+of the first unknown flag; `rm_main` short-circuits on the first hit
+and prints `rm: unknown option: <flag>\n` on stderr, then returns
+`EXIT_USAGE`. Partial-tail mismatches (e.g. `--recursve` as a typo
+of `--recursive`) are surfaced too — the pre-ENH-007 fall-through
+silently produced a non-recursive removal, defeating the flag's
+safety purpose. The `--` end-of-options convention is preserved
+by libpdx-argv upstream: tokens after a bare `--` are recorded in
+`pos_ptrs[]` and never enter `flag_names[]`, so `flags_scan` cannot
+see them (leading-hyphen positionals like `rm -- -weird-name` are
+treated as literal paths).
+
 ## 4. Standard-vocabulary flags (D3)
 
 The following flags are part of the wave-wide standard vocabulary
@@ -138,10 +157,17 @@ schedule below rather than declaring them per-flag here:
   returns 0 too.
 - `1 EXIT_OP_FAIL` — the trash-move failed (M2+ paths). rm.M1 never
   returns this.
-- `2 EXIT_USAGE` — the argv did not parse, or no positional was
-  supplied. rm.M1 returns this from the parse-fail path (`RmMain::
+- `2 EXIT_USAGE` — the argv did not parse, no positional was
+  supplied, or an unrecognised flag was passed (issue #25 / ENH-007).
+  rm.M1 returns this from the parse-fail path (`RmMain::
   PARSE_FAIL_MSG`) and the zero-positional path (`RmMain::
-  USAGE_MSG`).
+  USAGE_MSG`); rm 1.0.1 also returns it from the unknown-flag
+  rejection path, which emits `rm: unknown option: <flag>\n` on
+  stderr (the diagnostic reconstructs a `-` prefix for a one-byte
+  name and `--` otherwise; libpdx-argv stores flag names sans
+  leading dashes). `RmFlags::flags_scan` returns the first unknown
+  flag's interior name-pointer, or 0 for all-recognised; `rm_main`
+  short-circuits on the first hit.
 - `3 EXIT_NOT_YET_IMPL` — reserved for M2+ bodies that recognise a
   flag combination they do not yet implement. rm.M1 never returns
   this.

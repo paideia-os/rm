@@ -109,4 +109,42 @@ module Print = structure {
         ret;
       }
     }
+
+  // ============================================================================
+  // strlen_nul(ptr) -> len
+  //
+  // Signature: strlen_nul : (u64) -> u64 !{mem} @{}
+  // RDI (input): ptr — NUL-terminated byte string
+  // RAX (output): len — number of bytes before the terminator (NUL
+  //                     excluded); 0 on empty string.
+  //
+  // Byte-loop strlen for a caller that needs to pass the length of an
+  // in-argv interior name (ENH-007 unknown-flag diagnostic in RmMain).
+  // Same shape as mkfs.pdxfs's format_record_strlen — libpdx-argv
+  // stores flag names as pointers into argv, NUL-terminated in place,
+  // so the walk is bounded by the argv byte-page the shell owns.
+  //
+  // Register plan (leaf; no push/pop; only caller-save touched):
+  //   rax = counter (return value)
+  //   rcx = byte load scratch
+  //   rdi = cursor (advances one byte per iteration)
+  // ============================================================================
+  pub let strlen_nul : (u64) -> u64 !{mem} @{} =
+    fn (ptr: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.ENH-007 (issue #25) strlen_nul. Byte-loop strlen over a NUL-terminated string; returns byte count in rax (NUL excluded). Same idiom as mkfs.pdxfs format_record_strlen: xor rax,rax initialises the counter; xor rcx,rcx + mov_b rcx,[rdi] loads the current byte with the #1248 mitigation; cmp rcx,0 branches on NUL; add rax,1 + add rdi,1 advance both counter and cursor; jmp print_strlen_head repeats. Leaf function — only caller-save registers touched (rax/rcx/rdi), no push/pop parity to preserve, rsp % 16 == 8 on entry stays 8 with no nested calls. The caller (RmMain's ENH-007 unknown-flag diagnostic) owns the pointer lifetime: it is an interior pointer into the process's argv that libpdx-argv NUL-terminated in place, so the walk terminates within the same argv byte-page. No test mnemonic; every zero-check via cmp reg, 0. Labels prefixed print_strlen_ (paideia-as reserved-label discipline; `loop` is a keyword so print_strlen_head is used instead of print_strlen_loop).",
+      block: {
+        xor rax, rax;                       // counter = 0
+      print_strlen_head:
+        xor rcx, rcx;
+        mov_b rcx, [rdi];
+        cmp rcx, 0;
+        je print_strlen_done;
+        add rax, 1;
+        add rdi, 1;
+        jmp print_strlen_head;
+      print_strlen_done:
+        ret;
+      }
+    }
 }

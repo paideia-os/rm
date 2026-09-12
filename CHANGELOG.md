@@ -5,6 +5,72 @@ Every rm release follows semver (design/tooling/plan.md §D4). The
 design/tooling/r49-r50-plan.md §5.8); every subsequent entry adds one
 line to the top under the same shape.
 
+## 1.0.1 — 2026-09-12
+
+Patch release closing enhancement-v1.x issue #25 (`rm.ENH-007`). The
+1.0.0 unknown-flag hole is closed: `rm --nonesuch x` now prints
+`rm: unknown option: --nonesuch\n` on stderr and returns
+`EXIT_USAGE` (2) instead of silently performing a non-recursive
+removal on a typo'd `--recursive`.
+
+### Landed
+
+- **rm.ENH-007 (issue #25)** — unknown flags rejected with exit 2.
+  - `src/flags.pdx` — `flags_scan` signature changed from `() -> ()`
+    to `() -> u64`. Return value: 0 = every parsed flag recognised,
+    non-zero = interior name-pointer (into the argv byte-page libpdx-
+    argv NUL-terminated in place) of the first unknown flag. Every
+    branch that previously fell to `flags_advance` on a NON-match
+    (first-byte-switch fallthrough, and every partial-tail mismatch
+    inside a long-form compare) now jumps to `flags_scan_unknown`
+    which returns the name-pointer in rax. Branches that fall to
+    `flags_advance` after a successful match are unchanged. A `'p'`
+    arm was added to recognise `--pdx-schema` (well-known D3 flag
+    libpdx-argv's parser inline-toggles `ParsedArgs::emit_schema`
+    for; rm has no local state change but the name must not land in
+    the unknown path).
+  - `src/main.pdx` — after `call flags_scan`, `cmp rax, 0` gates the
+    diagnostic. On non-zero, `r12` holds the name-pointer across a
+    four-write emission sequence on fd 2: `rm: unknown option: ` +
+    `-` or `--` (chosen by `strlen_nul` result: 1 → short, else long)
+    + name + `\n`. Sets `rax = EXIT_USAGE` and jumps to the epilogue
+    so `audit_post` still commits the envelope with exit=2. The
+    reserved `[rsp+0]` pad slot spills the name length across the
+    dash-emission print_err call.
+  - `src/print.pdx` — new leaf `strlen_nul(ptr) -> len`. Same
+    byte-loop shape as `mkfs.pdxfs`'s `format_record_strlen`; no
+    push/pop parity, only caller-save touched, `xor rax,rax` +
+    `mov_b rcx,[rdi]` per the #1248 byte-load mitigation.
+  - `tests/m4_005_unknown_flag_reject.pdx` — three-scenario witness
+    directly exercising the flags_scan return contract. (A) known
+    short `-r`: rax==0, flag_r==1. (B) unknown long `--nonesuch`:
+    rax==&NAME_NONESUCH, flag_r==0. (C) partial-tail typo
+    `--recursve` (silently ignored pre-ENH-007): rax==&NAME_RECURSVE,
+    flag_r==0. Reset between scenarios so cross-scenario leakage
+    fails immediately. Emits `[rm.M4-005 OK]` / `[rm.M4-005 FAIL]`.
+    Wired into `tests/m4_runner.pdx` (fifth call, unchanged shape)
+    and `tests/expected-m4-fingerprints.txt`.
+  - `design/argv-surface.md` — §5 exit-code table §5 amended: the
+    unknown-flag path now joins the parse-error and zero-positional
+    paths as an EXIT_USAGE producer.
+  - `README.md` — §Options paragraph updated: the "silently
+    fall-through" caveat that named issue #25 is replaced with the
+    new ENH-007 reject-and-diagnose contract.
+  - `STATUS.md` — ENH-007 added to the enhancement-v1.x landed list;
+    the "Not landed this pass" line no longer names #25.
+
+### Substrate + release notes carried forward
+
+- The three substrate gaps documented under 1.0.0 (PdxFS v1 mutating
+  ops, `sys_pdxfs_undo_append`, signing bot host) are unchanged; no
+  transition happens with this patch.
+- The `v1.1` gate from `design/enhancement-plan.md` §10 (needs #18,
+  #19, #21 to close) still holds. 1.0.1 is a patch bump under that
+  gate; the tag remains under 1.x.
+- The `manifest.pdxsig` dual-sig footprint is unchanged in size, so
+  the re-sign path when the signing bot host stands up (T-INFRA-001/
+  002) requires no format changes.
+
 ## 1.0.0 — 2026-08-22
 
 **Signed release** (dual-signed manifest per D1.a, ML-DSA-65 by both

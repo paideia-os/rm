@@ -1,0 +1,234 @@
+// tests/m4_005_unknown_flag_reject.pdx -- rm.ENH-007 (issue #25)
+// M4Test005 module: unknown flag reject contract for flags_scan.
+//
+// Scope
+// -----
+// This module exercises the ENH-007 (issue #25) contract on
+// RmFlags::flags_scan:
+//
+//   rax == 0                → every parsed flag was recognised
+//   rax != 0                → interior pointer to the NUL-terminated
+//                             name of the first unknown flag
+//
+// Directly invoking rm_main from a source-only test would require
+// forging an argv the paideia-as loader stub would normally hand
+// us; instead this module drives flags_scan through its two
+// user-visible states (all-recognised and first-unknown) by
+// synthesising a ParsedArgs::flag_names[] window itself, in the
+// same fixture shape the M4 corpus uses to drive rm_process_one
+// without a live PdxFS substrate (tests/m4_001_txn_abort.pdx et al).
+//
+// The five assertions live in three scenarios:
+//
+//   Scenario A -- known short flag (-r):
+//     Populate flag_names[0] = &NAME_R (`"r\0"`), flag_count = 1;
+//     invoke flags_scan; expect rax == 0 AND flag_r == 1.
+//
+//   Scenario B -- unknown flag (--nonesuch):
+//     Populate flag_names[0] = &NAME_NONESUCH, flag_count = 1;
+//     invoke flags_scan; expect rax == &NAME_NONESUCH AND no
+//     boolean toggled (flags_reset zeroed all five before entry).
+//
+//   Scenario C -- mismatched long-form tail (--recursve, a typo of
+//   --recursive):
+//     Previously silently ignored at M1; ENH-007 now surfaces it as
+//     an unknown flag returning &NAME_RECURSVE. Verifies that a
+//     partial-tail mismatch is a real rejection, not just the
+//     first-byte-switch fallthrough.
+//
+// Substrate note
+// --------------
+// No PdxFS or elevate surface is touched by this test -- flags_scan
+// is a pure ParsedArgs -> .bss projection. The scenarios differ only
+// in the flag_names[] window each installs before calling.
+//
+// M4-005 test invariants asserted here
+// ------------------------------------
+// After each scenario:
+//
+//   A. flags_scan returns 0             AND flag_r == 1
+//   B. flags_scan returns &NAME_NONESUCH AND flag_r == 0 (unchanged)
+//   C. flags_scan returns &NAME_RECURSVE AND flag_r == 0
+//
+// Any divergence prints [rm.M4-005 FAIL] and returns 1; a clean run
+// prints [rm.M4-005 OK] and returns 0.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module M4Test005 (PascalCase basename).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (only 0, 1, and NAME_ pointer
+//     equality comparisons appear; the pointers compare via
+//     reg-reg cmp against a spilled copy so no imm64 is staged).
+//   - r11 is scratch (every .bss / .rodata lea).
+//   - Byte reads not needed here (all qword-wide flag_names writes
+//     and counter reads).
+//   - run_m4_005 prologue: 1-push (rbx) preserves the expected-
+//     pointer accumulator across the flags_scan call in scenarios B
+//     and C. Entry rsp % 16 == 8; push brings it to 0 for every
+//     nested call site (remove_reset, flags_reset, flags_scan,
+//     print_str).
+//   - Reserved-label discipline: labels prefixed m4_005_ (avoids the
+//     `loop`/`if` paideia-as keywords).
+//   - Effect tail !{mem, sysreg} @{cap, sched} matches the callee
+//     transitive maximum: remove_reset declares @{cap, sched} via its
+//     M3 module reset delegates (schema_reset / audit_reset /
+//     undo_reset / elevate_reset), and the caller must commit to a
+//     superset for the call to type-check.
+
+module M4UnknownFlagReject = structure {
+
+  // -- Rodata: three flag-name strings this test synthesises into
+  // ParsedArgs::flag_names[]. Each is NUL-terminated in place; the
+  // real libpdx-argv parse path would NUL-terminate them inside the
+  // argv byte-page, but for the test they live in .rodata (flags_scan
+  // never writes through the pointer, only reads).
+  //
+  // Layout matches libpdx-argv's storage discipline: short-flag names
+  // are 1 char + NUL, long-flag names are N>1 chars + NUL.
+  pub let NAME_R         : [u8; 2]  = "r\0"                    // known short
+  pub let NAME_NONESUCH  : [u8; 10] = "nonesuch\0"             // unknown long
+  pub let NAME_RECURSVE  : [u8; 10] = "recursve\0"             // typo of recursive
+
+  // -- Fingerprint lines emitted to stdout via Print::print_str --------
+  pub let OK_MSG     : [u8; 15] = "[rm.M4-005 OK]\n"
+  pub let OK_MSG_LEN : u64      = 15
+
+  pub let FAIL_MSG     : [u8; 17] = "[rm.M4-005 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 17
+
+  // ============================================================================
+  // run_m4_005() -> u64
+  //
+  // Signature: run_m4_005 : () -> u64 !{mem, sysreg} @{cap, sched}
+  // RAX (output): 0 = OK, 1 = FAIL.
+  //
+  // Body:
+  //   Scenario A (known short flag -r):
+  //     reset -> install flag_names[0] = &NAME_R; flag_count = 1
+  //     call flags_scan; expect rax == 0 AND flag_r == 1
+  //
+  //   Scenario B (unknown long flag --nonesuch):
+  //     reset -> install flag_names[0] = &NAME_NONESUCH; flag_count = 1
+  //     spill &NAME_NONESUCH in rbx
+  //     call flags_scan; expect rax == rbx AND flag_r == 0
+  //
+  //   Scenario C (partial-tail mismatch --recursve typo):
+  //     reset -> install flag_names[0] = &NAME_RECURSVE; flag_count = 1
+  //     spill &NAME_RECURSVE in rbx
+  //     call flags_scan; expect rax == rbx AND flag_r == 0
+  //
+  //   All-clean -> print OK_MSG on stdout, return 0
+  //   Any FAIL  -> print FAIL_MSG on stdout, return 1
+  //
+  // Register plan (1-push prologue):
+  //   push rbx    -- rsp%16: 8 -> 0
+  //   rbx = expected-pointer accumulator (scenarios B and C)
+  //   rax = call return / scratch
+  //   rdi = print buf
+  //   rsi = print len
+  //   r11 = lea scratch (every .bss / .rodata lea)
+  // ============================================================================
+  pub let run_m4_005 : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.ENH-007 (issue #25) M4Test005::run_m4_005. Exercises the flags_scan return contract in three scenarios: (A) known short flag -r: flag_names[0] points at NAME_R, flag_count=1, expect rax==0 AND flag_r==1; (B) unknown long flag --nonesuch: flag_names[0] points at NAME_NONESUCH, expect rax==&NAME_NONESUCH AND flag_r stays 0; (C) partial-tail typo --recursve (was silently ignored pre-ENH-007): flag_names[0] points at NAME_RECURSVE, expect rax==&NAME_RECURSVE AND flag_r stays 0. Scenarios B and C spill the expected pointer into rbx across the flags_scan call (SysV callee-save; the 1-push prologue brings rsp%16 from 8 to 0 for every nested call site). Between scenarios, flags_reset zeroes the five boolean slots so a cross-scenario false positive (e.g. -r's slot leaking into scenario B) is caught immediately. Each scenario writes a synthetic ParsedArgs window: xor rax,rax + mov [flag_count],1 sets the count via a single mov (the imm 1 fits imm32); lea r11,[NAME_*] + mov [flag_names+0*8],r11 installs the pointer; the address of NAME_* is rip-relative so no imm64 is staged. All immediates 0, 1, or address deltas -- every one within imm32. No test mnemonic; every zero-check via cmp reg, 0. r11 scratch across every .bss / .rodata lea. Labels prefixed m4_005_ per the paideia-as reserved-label discipline (`loop`/`if` are keywords).",
+      block: {
+        push rbx;                                // rsp%16: 8 -> 0
+
+        // -------- Scenario A: known short flag -r ---------------------
+        call remove_reset;
+        call flags_reset;
+
+        // flag_count = 1
+        mov rax, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rax;
+
+        // flag_names[0] = &NAME_R
+        lea rax, [rip + NAME_R];
+        lea r11, [rip + flag_names];
+        mov [r11 + 0], rax;
+
+        call flags_scan;
+
+        //   rax == 0 (all recognised)
+        cmp rax, 0;
+        jne m4_005_fail;
+
+        //   flag_r == 1
+        lea r11, [rip + flag_r];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne m4_005_fail;
+
+        // -------- Scenario B: unknown long flag --nonesuch ------------
+        call remove_reset;
+        call flags_reset;
+
+        // flag_count = 1
+        mov rax, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rax;
+
+        // flag_names[0] = &NAME_NONESUCH; spill expected ptr in rbx
+        lea rbx, [rip + NAME_NONESUCH];
+        lea r11, [rip + flag_names];
+        mov [r11 + 0], rbx;
+
+        call flags_scan;
+
+        //   rax == &NAME_NONESUCH
+        cmp rax, rbx;
+        jne m4_005_fail;
+
+        //   flag_r == 0 (no false positive)
+        lea r11, [rip + flag_r];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_005_fail;
+
+        // -------- Scenario C: partial-tail typo --recursve ------------
+        call remove_reset;
+        call flags_reset;
+
+        // flag_count = 1
+        mov rax, 1;
+        lea r11, [rip + flag_count];
+        mov [r11], rax;
+
+        // flag_names[0] = &NAME_RECURSVE; spill expected ptr in rbx
+        lea rbx, [rip + NAME_RECURSVE];
+        lea r11, [rip + flag_names];
+        mov [r11 + 0], rbx;
+
+        call flags_scan;
+
+        //   rax == &NAME_RECURSVE (partial-tail miss returns name_ptr)
+        cmp rax, rbx;
+        jne m4_005_fail;
+
+        //   flag_r == 0 (partial match did not set the bool)
+        lea r11, [rip + flag_r];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne m4_005_fail;
+
+        // -------- OK path --------------------------------------------
+        lea rdi, [rip + OK_MSG];
+        mov rsi, 15;                             // OK_MSG_LEN
+        call print_str;
+        pop rbx;
+        xor rax, rax;                            // 0 = OK
+        ret;
+
+      m4_005_fail:
+        lea rdi, [rip + FAIL_MSG];
+        mov rsi, 17;                             // FAIL_MSG_LEN
+        call print_str;
+        pop rbx;
+        mov rax, 1;                              // 1 = FAIL
+        ret;
+      }
+    }
+}

@@ -1,4 +1,4 @@
-// src/main.pdx — rm.M3-002 (extends M3-001)
+// src/main.pdx — rm.M3-002 (extends M3-001) + ENH-007 (issue #25)
 // RmMain module: rm_main(argc, argv) entry point.
 //
 // Scope
@@ -77,6 +77,30 @@ module Main = structure {
     "usage: rm [-r|-f|-v|--wipe|--dry-run] <path>\n"
   pub let USAGE_MSG_LEN : u64 = 46
 
+  // -- ENH-007 (issue #25) unknown-flag diagnostic ---------------------
+  // Emitted on stderr as three sys_write calls whenever RmFlags::
+  // flags_scan returns a non-zero (interior name-pointer) result:
+  //
+  //   [1] UNKNOWN_FLAG_PREFIX     -- literal "rm: unknown option: "
+  //   [2] UNKNOWN_FLAG_DASH1/2    -- reconstructed leading '-' or '--'
+  //                                  based on the strlen of the name
+  //                                  (libpdx-argv stores short-flag
+  //                                  names as one byte + NUL and long-
+  //                                  flag names as N>1 bytes + NUL)
+  //   [3] name                    -- the interior name from the argv
+  //                                  buffer (Print::strlen_nul-sized)
+  //   [4] UNKNOWN_FLAG_NL         -- terminating newline
+  //
+  // The three writes together produce e.g. "rm: unknown option: -q\n"
+  // for a short flag and "rm: unknown option: --nonesuch\n" for a
+  // long one, matching the D3 diagnostic style RmMain's existing
+  // PARSE_FAIL_MSG and USAGE_MSG paths already use.
+  pub let UNKNOWN_FLAG_PREFIX     : [u8; 20] = "rm: unknown option: "
+  pub let UNKNOWN_FLAG_PREFIX_LEN : u64      = 20
+  pub let UNKNOWN_FLAG_DASH1      : [u8; 1]  = "-"
+  pub let UNKNOWN_FLAG_DASH2      : [u8; 2]  = "--"
+  pub let UNKNOWN_FLAG_NL         : [u8; 1]  = "\n"
+
   // ============================================================================
   // rm_main(argc, argv) -> exit_code
   //
@@ -99,7 +123,7 @@ module Main = structure {
   pub let rm_main : (u64, u64) -> u64 !{mem, sysreg} @{} =
     fn (argc: u64) (argv: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M3-002 rm_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset (ParsedArgs + RmRemove umbrella which zeroes every M3 module's observability including audit) → audit_pre (envelope open, so every exit path can journal a commit) → parse → scan flags → schema_bind_stdout (M3-001) → validate positional count → dispatch to RmRemove::rm_remove_body → audit_post (envelope close with exit code). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site. rbx preserved across every nested call by SysV callee-save; r12 preserved through dispatch and re-purposed at the epilogue to hold the exit code across the RmAudit::audit_post call (argc no longer needed after dispatch). Parse-fail path: print PARSE_FAIL_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. Zero-positional path: print USAGE_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. Otherwise: dispatch on pos_ptrs[0], audit_post commits with rm_remove_body's rax. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. remove_reset hoisted to top of body so audit_pre's audit_id_slot survives the reset envelope; if audit_pre came before remove_reset the zero would clobber the id. Return: pop pad, pop r12, pop rbx, ret with rax carrying the exit code preserved across audit_post via r12.",
+      justification: "rm.M3-002 + ENH-007 (issue #25) rm_main. Entry point invoked by the paideia-as loader stub with argc in rdi + argv in rsi. Flow: reset (ParsedArgs + RmRemove umbrella which zeroes every M3 module's observability including audit) → audit_pre (envelope open, so every exit path can journal a commit) → parse → scan flags (ENH-007: check flags_scan return for unknown-flag rejection) → schema_bind_stdout (M3-001) → validate positional count → dispatch to RmRemove::rm_remove_body → audit_post (envelope close with exit code). 2-push prologue (rbx=argv, r12=argc) plus a `sub rsp, 8` reserved pad keeps rsp%16 == 0 at every nested call site; the pad slot at [rsp+0] is also used by the ENH-007 unknown-flag path to spill the name length across the second print_err call (the flow is diagnostic-only, so the pad's original 'reserved' status is preserved — nothing else touches [rsp+0]). rbx preserved across every nested call by SysV callee-save; r12 preserved through dispatch and re-purposed at (i) the ENH-007 unknown-flag path to hold the name pointer across strlen_nul + 3 print_err calls (argc no longer needed after parse_argv returned), and (ii) the epilogue to hold the exit code across the RmAudit::audit_post call. Parse-fail path: print PARSE_FAIL_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. ENH-007 unknown-flag path: emit `rm: unknown option: ` + `-`/`--` + name + `\\n` in four sys_writes on fd 2, set rax = EXIT_USAGE, jmp epilogue. Zero-positional path: print USAGE_MSG on stderr; set rax = EXIT_USAGE; audit_post commits with exit=2. Otherwise: dispatch on pos_ptrs[0], audit_post commits with rm_remove_body's rax. All immediates within cmp reg,imm ≤ 0x7FFFFFFF. remove_reset hoisted to top of body so audit_pre's audit_id_slot survives the reset envelope; if audit_pre came before remove_reset the zero would clobber the id. Return: pop pad, pop r12, pop rbx, ret with rax carrying the exit code preserved across audit_post via r12.",
       block: {
         // Prologue: preserve argc/argv, align stack.
         push rbx;                              // rsp%16: 8 → 0
@@ -141,10 +165,57 @@ module Main = structure {
         jmp rm_main_epilogue;
 
       rm_main_parse_ok:
-        // Step 4: reset + scan the flag slots.
+        // Step 4: reset + scan the flag slots. ENH-007 (issue #25):
+        // flags_scan now returns 0 on all-recognised, or the interior
+        // name-pointer of the first unknown flag; the loop is short-
+        // circuited on the first hit so only that flag is diagnosed
+        // (the user fixes one typo at a time).
         call flags_reset;
         call flags_scan;
+        cmp rax, 0;
+        je rm_main_flags_ok;
 
+        // ENH-007 unknown-flag path: rax = interior name-pointer into
+        // the caller's argv buffer. Preserve it in r12 (SysV callee-
+        // save survives strlen_nul + 3 print_err calls). Emit the
+        // diagnostic in four writes on fd 2 as described above the
+        // UNKNOWN_FLAG_* strings; spill the strlen result into the
+        // reserved [rsp+0] pad slot so the second print_err (for the
+        // name) can reuse it. audit_post at the epilogue commits the
+        // envelope with exit=2 like every other EXIT_USAGE path.
+        mov r12, rax;                          // r12 = name_ptr
+
+        lea rdi, [rip + UNKNOWN_FLAG_PREFIX];
+        mov rsi, 20;                           // UNKNOWN_FLAG_PREFIX_LEN
+        call print_err;
+
+        mov rdi, r12;
+        call strlen_nul;                       // rax = name_len
+        mov [rsp + 0], rax;                    // spill name_len into pad
+
+        cmp rax, 1;
+        je rm_main_unknown_dash1;
+        lea rdi, [rip + UNKNOWN_FLAG_DASH2];
+        mov rsi, 2;
+        jmp rm_main_unknown_emit_dash;
+      rm_main_unknown_dash1:
+        lea rdi, [rip + UNKNOWN_FLAG_DASH1];
+        mov rsi, 1;
+      rm_main_unknown_emit_dash:
+        call print_err;
+
+        mov rdi, r12;
+        mov rsi, [rsp + 0];                    // reload name_len
+        call print_err;
+
+        lea rdi, [rip + UNKNOWN_FLAG_NL];
+        mov rsi, 1;
+        call print_err;
+
+        mov rax, 2;                            // EXIT_USAGE
+        jmp rm_main_epilogue;
+
+      rm_main_flags_ok:
         // Step 4b (M3-001): bind fd 1 to the RemoveRecord@0.1 schema.
         // Failure is non-fatal at M3 (see schema.pdx §Substrate-and-
         // broker note); observability lives in schema_bind_ok /

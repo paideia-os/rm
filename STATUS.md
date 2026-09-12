@@ -2,7 +2,8 @@
 
 **Wave:** R50 (Wave 2)
 **Current milestone:** M5 (signed 1.0.0 release) — complete
-**Version:** 1.0.0 (author-signed; awaits paideia_root_pk re-sign
+**Version:** 1.0.1 (patch release for enhancement-v1.x issue #25 /
+              ENH-007; author-signed; awaits paideia_root_pk re-sign
               once T-INFRA-001/002 stand up the signing bot host)
 
 See `design/tooling/r49-r50-plan.md` §5.8 in paideia-os for the full
@@ -228,10 +229,26 @@ Findings from `design/enhancement-plan.md`; issues #18-#27 (milestone
   exit-code table (3 = `EXIT_NOT_YET_IMPL`, reserved; 4 is a
   loader-side exec-time denial rm's own body never returns), and the
   M3-004 entry above.
+- `src/flags.pdx` + `src/main.pdx` + `src/print.pdx` +
+  `tests/m4_005_unknown_flag_reject.pdx` (issue #25, ENH-007, 1.0.1
+  patch release): unknown flags rejected with `EXIT_USAGE`.
+  `flags_scan` signature changed from `() -> ()` to `() -> u64` (0
+  on all-recognised, interior name-pointer on the first unknown
+  flag); every branch that previously silently fell through on a
+  non-match now jumps to `flags_scan_unknown` and short-circuits the
+  loop. New `p` arm recognises the well-known D3 `--pdx-schema`
+  flag. `rm_main` emits `rm: unknown option: <flag>\n` on stderr in
+  four sys_writes (prefix + reconstructed dash(es) + name + `\n`),
+  using the reserved `[rsp+0]` pad slot to spill the strlen across
+  the dash-emission print_err call. `strlen_nul` added to `print.pdx`
+  as a byte-loop leaf. Test `M4Test005::run_m4_005` exercises three
+  scenarios: known short (rax==0), unknown long, partial-tail typo
+  (both return the expected name-pointer, no false-positive on
+  `flag_r`). Wired into the M4 runner and fingerprint corpus.
 - Not landed this pass: #19 (elevate gate matches unresolved argv
   bytes — blocked on a shared path-canonicalisation library and a
   loader-narrowing answer neither of which exist yet; see issue #19
-  and enhancement-plan.md §11 items 1-2), #20, #21, #22, #24, #25.
+  and enhancement-plan.md §11 items 1-2), #20, #21, #22, #24.
 
 ## Upstream substrate (paideia-os, at HEAD 2026-08-21)
 

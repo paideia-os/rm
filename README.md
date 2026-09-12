@@ -69,13 +69,24 @@ default retention path.
 `--recursive`, `--force`, and `--verbose` are recognised as long aliases of
 `-r`, `-f`, `-v` respectively (issue #26; doc/rm.pdxdoc has documented all
 three since 1.0.0, but the source did not implement them until this fix).
-`RmFlags::flags_scan` (`src/flags.pdx`) still switches on first byte
-(`r`/`f`/`v`/`w`/`d`) and now nests a second-byte check per branch: a NUL
+`RmFlags::flags_scan` (`src/flags.pdx`) switches on the first byte
+(`r`/`f`/`v`/`w`/`d`/`p`) and nests a second-byte check per branch: a NUL
 right after the first byte is the short form, otherwise the remaining bytes
-are matched against the long form's tail. An unrecognised flag (including a
-long-form tail that doesn't match) still falls through **silently** rather
-than failing with a usage error — that rejection contract remains open
-(issue #25).
+are matched against the long form's tail. The `p` arm recognises the
+well-known D3 `--pdx-schema` flag (libpdx-argv toggles
+`ParsedArgs::emit_schema` for it inline in the parser).
+
+**Unrecognised flags are rejected with exit 2** (issue #25 / ENH-007, closed
+in 1.0.1). `flags_scan` returns 0 on all-recognised or the interior
+name-pointer of the first unknown flag; `rm_main` short-circuits on the
+first hit, emits `rm: unknown option: <flag>\n` on stderr (reconstructing
+a `-` prefix for a one-byte name and `--` otherwise; libpdx-argv stores
+flag names sans leading dashes), and returns `EXIT_USAGE`. Partial-tail
+mismatches like `--recursve` (typo of `--recursive`) are surfaced too,
+closing the pre-1.0.1 safety trap where a typo'd `--recursive` silently
+produced a non-recursive removal. The `--` end-of-options convention is
+preserved by libpdx-argv upstream, so `rm -- -weird-name` treats the
+`-weird-name` as a literal path.
 
 ## Exit codes
 

@@ -21,4 +21,5 @@
 [rm.M4-002 OK]
 [rm.M4-003 OK]
 [rm.M4-004 OK]
+[rm.M4-005 OK]
 [rm.M4-runner done]

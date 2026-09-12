@@ -1,4 +1,4 @@
-// src/flags.pdx — rm.M1-002
+// src/flags.pdx — rm.M1-002 + ENH-007 (issue #25)
 // RmFlags module: walk ParsedArgs::flag_names[0..flag_count] and
 // project the five rm-recognised flags into five boolean .bss slots
 // the rest of rm reads directly.
@@ -7,19 +7,31 @@
 // -----
 // The M1 argv surface accepts five flags — `-r`, `-f`, `-v`,
 // `--wipe`, `--dry-run` — per §5.8 of design/tooling/r49-r50-plan.md
-// in the paideia-os repo. libpdx-argv already parses them (short-
-// flag grammar at M1-002, long-flag grammar at M1-001) and stores
-// each recognised flag as a name-pointer + value-pointer pair in
-// ParsedArgs::flag_names[] + flag_values[]. This module reads those
-// arrays and sets one boolean slot per known flag.
+// in the paideia-os repo, and ENH-008 (issue #26) added the long
+// aliases `--recursive`, `--force`, `--verbose`. libpdx-argv parses
+// each (short-flag grammar at M1-002, long-flag grammar at M1-001)
+// and stores each recognised flag as a name-pointer + value-pointer
+// pair in ParsedArgs::flag_names[] + flag_values[]. This module reads
+// those arrays and sets one boolean slot per known flag.
 //
 // The five flags have distinct first bytes (r / f / v / w / d) so
 // the scanner uses a first-byte switch and a per-branch inline
 // byte-compare (same idiom as libpdx-argv's --pdx-schema well-known
-// check in src/parser.pdx). Unknown flags fall through silently at
-// M1 — the unknown-flag rejection contract is a body edit inside
-// this module scheduled for M4 (test invariant "unknown flag → exit
-// 2") and does not require a signature change on flags_scan.
+// check in src/parser.pdx). ENH-007 (issue #25) closes the M1
+// unknown-flag hole documented in this preamble's earlier revision:
+// flags_scan now returns a u64 (0 = all recognised, non-zero =
+// interior pointer to the first unknown flag's NUL-terminated name)
+// so rm_main can emit the D3 usage diagnostic (rm: unknown option:
+// <flag>\n on stderr) and return EXIT_USAGE (2) instead of silently
+// producing a non-recursive removal on `rm --recursive` typo'd as
+// `rm --recursve`. A 'p' arm was added to the first-byte switch to
+// accept the well-known D3 --pdx-schema flag (libpdx-argv's parser
+// toggles ParsedArgs::emit_schema for it; rm itself has no state
+// change, but recognising the name here keeps it out of the unknown
+// path). The `--` end-of-options convention is preserved by
+// libpdx-argv upstream: argv tokens after a bare `--` land in
+// pos_ptrs[] and never appear in flag_names[], so flags_scan cannot
+// see them.
 //
 // rm.ENH-008 (issue #26): -r, -f, and -v also accept their long forms
 // (--recursive, --force, --verbose respectively) — doc/rm.pdxdoc has
@@ -115,22 +127,34 @@ module Flags = structure {
     }
 
   // ============================================================================
-  // flags_scan()
+  // flags_scan() -> u64
   //
-  // Signature: flags_scan : () -> () !{mem} @{}
+  // Signature: flags_scan : () -> u64 !{mem} @{}
   //
   // Walk ParsedArgs::flag_names[0..flag_count]. For each name, do a
   // first-byte switch on the byte at [name+0] and, on a match, verify
   // the remaining bytes inline. On full match, write 1 to the matching
-  // boolean slot. Unknown flags fall through — at M1 they are
-  // silently ignored; the M4 rejection contract lands as a body edit
-  // that returns rax != 0 on the first unknown flag.
+  // boolean slot (or, for --pdx-schema, no state change — libpdx-argv's
+  // parser already toggled ParsedArgs::emit_schema).
+  //
+  // ENH-007 (issue #25) return contract:
+  //   rax == 0             → every parsed flag was recognised
+  //   rax != 0             → interior pointer to the NUL-terminated
+  //                          name of the first unknown flag; rm_main
+  //                          composes `rm: unknown option: <flag>\n`
+  //                          from this pointer and returns EXIT_USAGE.
+  //
+  // The pointer identity (rather than an index) short-cuts the caller:
+  // libpdx-argv already NUL-terminates the name in place inside the
+  // argv buffer, so print_err can consume the returned pointer with a
+  // one-pass strlen and no extra lookup into flag_names[].
   //
   // Register plan (leaf; only reads ParsedArgs and writes own .bss):
   //   r8  = i           (loop counter over flag_names[])
   //   r9  = flag_count  (loaded once at loop entry)
-  //   rdx = name_ptr    (flag_names[i]; NUL-terminated)
-  //   rax = byte load scratch
+  //   rdx = name_ptr    (flag_names[i]; NUL-terminated) — also the
+  //                     return value on the unknown-flag exit
+  //   rax = byte load scratch / return value
   //   r11 = lea scratch (every .bss access uses lea r11, [rip + sym])
   //
   // The name-pointer for each entry is INTERIOR into the process's
@@ -140,10 +164,10 @@ module Flags = structure {
   // in the shell-supplied argv buffer; the caller-owned invariant
   // guarantees they are valid for read.
   // ============================================================================
-  pub let flags_scan : () -> () !{mem} @{} =
+  pub let flags_scan : () -> u64 !{mem} @{} =
     fn () -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "rm.ENH-008 (issue #26), extends M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d' (distinct across the M1 vocabulary); per-branch inline byte-compare with #1248-mitigated byte loads. flags_try_r/f/v each nest a second-byte branch: NUL at [rdx+1] matches the short form (flags_try_{r,f,v}_short); otherwise the tail is compared against the long alias ('ecursive'/'orce'/'erbose' + NUL) so --recursive/--force/--verbose set the same boolean slot as their short form. Unknown flags (including a mismatched long-form tail) fall through silently at M1 (documented in design/argv-surface.md; enforcement lands at M4 as a body edit returning a u64 error code). All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
+      justification: "rm.ENH-007 (issue #25), extends rm.ENH-008 (issue #26) and rm.M1-002 flags_scan. Iterate ParsedArgs::flag_names[0..flag_count] and set the five boolean slots on match. First-byte switch over 'r'/'f'/'v'/'w'/'d'/'p' (distinct across the ENH-007 vocabulary: r,f,v,w,d for rm's own flags plus 'p' for the well-known --pdx-schema which libpdx-argv also inline-recognises); per-branch inline byte-compare with #1248-mitigated byte loads. flags_try_r/f/v each nest a second-byte branch: NUL at [rdx+1] matches the short form (flags_try_{r,f,v}_short); otherwise the tail is compared against the long alias ('ecursive'/'orce'/'erbose' + NUL) so --recursive/--force/--verbose set the same boolean slot as their short form. --pdx-schema is a well-known D3 flag; the 'p' arm matches its tail exactly and falls through to flags_advance with NO local state change (libpdx-argv's parse_argv already toggled ParsedArgs::emit_schema on this argv token). ENH-007 (issue #25) return contract: rax==0 on all-recognised (xor rax,rax at flags_scan_done), rax==name_ptr on the first unknown flag (mov rax,rdx at flags_scan_unknown; ret). Every branch that previously fell to `flags_advance` because a name did not match the arm it entered now jumps to `flags_scan_unknown` instead — this covers (a) the first-byte switch's fall-through for a byte outside {r,f,v,w,d,p}, and (b) every intermediate byte mismatch inside a long-form tail comparison (e.g. --recursve would set 'r' + 'e' + 'c' + 'u' but mismatch on 'r' vs 'v' at [rdx+4]; that jne now targets flags_scan_unknown). Branches that fall to flags_advance AFTER a successful match (the flags_try_*_short slots that set their boolean, and the flags_try_pdx_schema completion) are unchanged. The `--` end-of-options convention is enforced upstream by libpdx-argv: tokens after a bare `--` are recorded in pos_ptrs[] and never enter flag_names[], so flags_scan never observes them. All immediates fit within cmp reg,imm ≤ 0x7FFFFFFF (char codes ≤ 0x7F). Leaf function — no push/pop parity. r11 is scratch, used in every lea for the ParsedArgs externals and this module's five .bss slots.",
       block: {
         xor r8, r8;                              // i = 0
         lea r11, [rip + flag_count];
@@ -169,7 +193,9 @@ module Flags = structure {
         je flags_try_wipe;
         cmp rax, 0x64;                           // 'd' (dry-run)
         je flags_try_dry_run;
-        jmp flags_advance;                       // unknown → silently ignored at M1
+        cmp rax, 0x70;                           // 'p' (--pdx-schema well-known)
+        je flags_try_pdx_schema;
+        jmp flags_scan_unknown;                  // unknown → return name_ptr
 
       // ---- -r (NUL at [rdx+1]) OR --recursive ('r' + "ecursive" + NUL) ----
       // rm.ENH-008 (issue #26): the doc has always documented `-r,
@@ -178,21 +204,23 @@ module Flags = structure {
       // obstacle argv-surface.md §61-68 already named: a match on the
       // short form's NUL falls to flags_try_r_short below; anything
       // else is checked against "ecursive" + NUL before giving up.
+      // rm.ENH-007 (issue #25): a partial-tail mismatch (e.g. --recursve)
+      // is a typo, not a silent no-op — jne targets flags_scan_unknown.
       flags_try_r:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
         je flags_try_r_short;
         cmp rax, 0x65;                           // 'e' (--recursive)
-        jne flags_advance;
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x63; jne flags_advance;  // 'c'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x75; jne flags_advance;  // 'u'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_advance;  // 's'
-        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x69; jne flags_advance;  // 'i'
-        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0x76; jne flags_advance;  // 'v'
-        xor rax, rax; mov_b rax, [rdx + 8]; cmp rax, 0x65; jne flags_advance;  // 'e'
-        xor rax, rax; mov_b rax, [rdx + 9]; cmp rax, 0;    jne flags_advance;  // NUL
+        jne flags_scan_unknown;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x63; jne flags_scan_unknown;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x75; jne flags_scan_unknown;  // 'u'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_scan_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_scan_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x69; jne flags_scan_unknown;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0x76; jne flags_scan_unknown;  // 'v'
+        xor rax, rax; mov_b rax, [rdx + 8]; cmp rax, 0x65; jne flags_scan_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 9]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
 
       flags_try_r_short:
         mov rax, 1;
@@ -202,17 +230,18 @@ module Flags = structure {
 
       // ---- -f (NUL at [rdx+1]) OR --force ('f' + "orce" + NUL) ----------
       // rm.ENH-008 (issue #26): see flags_try_r above for the pattern.
+      // rm.ENH-007 (issue #25): partial-tail mismatch → flags_scan_unknown.
       flags_try_f:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
         je flags_try_f_short;
         cmp rax, 0x6F;                           // 'o' (--force)
-        jne flags_advance;
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x63; jne flags_advance;  // 'c'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x65; jne flags_advance;  // 'e'
-        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0;    jne flags_advance;  // NUL
+        jne flags_scan_unknown;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_scan_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x63; jne flags_scan_unknown;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x65; jne flags_scan_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
 
       flags_try_f_short:
         mov rax, 1;
@@ -222,19 +251,20 @@ module Flags = structure {
 
       // ---- -v (NUL at [rdx+1]) OR --verbose ('v' + "erbose" + NUL) ------
       // rm.ENH-008 (issue #26): see flags_try_r above for the pattern.
+      // rm.ENH-007 (issue #25): partial-tail mismatch → flags_scan_unknown.
       flags_try_v:
         xor rax, rax;
         mov_b rax, [rdx + 1];
         cmp rax, 0;
         je flags_try_v_short;
         cmp rax, 0x65;                           // 'e' (--verbose)
-        jne flags_advance;
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x62; jne flags_advance;  // 'b'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x6F; jne flags_advance;  // 'o'
-        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_advance;  // 's'
-        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x65; jne flags_advance;  // 'e'
-        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_advance;  // NUL
+        jne flags_scan_unknown;
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x72; jne flags_scan_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x62; jne flags_scan_unknown;  // 'b'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x6F; jne flags_scan_unknown;  // 'o'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x73; jne flags_scan_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x65; jne flags_scan_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
 
       flags_try_v_short:
         mov rax, 1;
@@ -243,35 +273,70 @@ module Flags = structure {
         jmp flags_advance;
 
       // ---- --wipe: 'w' 'i' 'p' 'e' NUL ----
+      // rm.ENH-007 (issue #25): tail mismatch → flags_scan_unknown.
       flags_try_wipe:
-        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x69; jne flags_advance;  // 'i'
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x70; jne flags_advance;  // 'p'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x65; jne flags_advance;  // 'e'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0;    jne flags_advance;  // NUL
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x69; jne flags_scan_unknown;  // 'i'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x70; jne flags_scan_unknown;  // 'p'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x65; jne flags_scan_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
         mov rax, 1;
         lea r11, [rip + flag_wipe];
         mov [r11], rax;
         jmp flags_advance;
 
       // ---- --dry-run: 'd' 'r' 'y' '-' 'r' 'u' 'n' NUL ----
+      // rm.ENH-007 (issue #25): tail mismatch → flags_scan_unknown.
       flags_try_dry_run:
-        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x72; jne flags_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x79; jne flags_advance;  // 'y'
-        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x2D; jne flags_advance;  // '-'
-        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_advance;  // 'r'
-        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x75; jne flags_advance;  // 'u'
-        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6E; jne flags_advance;  // 'n'
-        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_advance;  // NUL
+        xor rax, rax; mov_b rax, [rdx + 1]; cmp rax, 0x72; jne flags_scan_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 2]; cmp rax, 0x79; jne flags_scan_unknown;  // 'y'
+        xor rax, rax; mov_b rax, [rdx + 3]; cmp rax, 0x2D; jne flags_scan_unknown;  // '-'
+        xor rax, rax; mov_b rax, [rdx + 4]; cmp rax, 0x72; jne flags_scan_unknown;  // 'r'
+        xor rax, rax; mov_b rax, [rdx + 5]; cmp rax, 0x75; jne flags_scan_unknown;  // 'u'
+        xor rax, rax; mov_b rax, [rdx + 6]; cmp rax, 0x6E; jne flags_scan_unknown;  // 'n'
+        xor rax, rax; mov_b rax, [rdx + 7]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
         mov rax, 1;
         lea r11, [rip + flag_dry_run];
         mov [r11], rax;
         jmp flags_advance;
 
+      // ---- --pdx-schema: 'p' 'd' 'x' '-' 's' 'c' 'h' 'e' 'm' 'a' NUL ----
+      // rm.ENH-007 (issue #25): --pdx-schema is a well-known D3 flag
+      // (libpdx-argv src/parser.pdx L292-313 inline-toggles
+      // ParsedArgs::emit_schema for it, regardless of FlagSpec
+      // registration). rm itself has no state change to make here —
+      // schema.pdx binds the fd 1 semantic-pipe unconditionally at
+      // rm_main entry — but the name must be recognised to stay out
+      // of the ENH-007 unknown-flag path. Any tail mismatch is a real
+      // unknown → flags_scan_unknown.
+      flags_try_pdx_schema:
+        xor rax, rax; mov_b rax, [rdx + 1];  cmp rax, 0x64; jne flags_scan_unknown;  // 'd'
+        xor rax, rax; mov_b rax, [rdx + 2];  cmp rax, 0x78; jne flags_scan_unknown;  // 'x'
+        xor rax, rax; mov_b rax, [rdx + 3];  cmp rax, 0x2D; jne flags_scan_unknown;  // '-'
+        xor rax, rax; mov_b rax, [rdx + 4];  cmp rax, 0x73; jne flags_scan_unknown;  // 's'
+        xor rax, rax; mov_b rax, [rdx + 5];  cmp rax, 0x63; jne flags_scan_unknown;  // 'c'
+        xor rax, rax; mov_b rax, [rdx + 6];  cmp rax, 0x68; jne flags_scan_unknown;  // 'h'
+        xor rax, rax; mov_b rax, [rdx + 7];  cmp rax, 0x65; jne flags_scan_unknown;  // 'e'
+        xor rax, rax; mov_b rax, [rdx + 8];  cmp rax, 0x6D; jne flags_scan_unknown;  // 'm'
+        xor rax, rax; mov_b rax, [rdx + 9];  cmp rax, 0x61; jne flags_scan_unknown;  // 'a'
+        xor rax, rax; mov_b rax, [rdx + 10]; cmp rax, 0;    jne flags_scan_unknown;  // NUL
+        jmp flags_advance;                       // recognised; no local state change
+
       flags_advance:
         add r8, 1;
         jmp flags_scan_loop_head;
 
+      // ENH-007 (issue #25) exit path — the first unknown flag returns
+      // its NUL-terminated interior name-ptr in rax. rdx already holds
+      // flag_names[i] from the loop head; move it into rax and return.
+      // The loop is short-circuited: the caller (rm_main) reports the
+      // FIRST unknown and returns EXIT_USAGE, so continuing past this
+      // flag would surface a stale later error to the user.
+      flags_scan_unknown:
+        mov rax, rdx;
+        ret;
+
       flags_scan_done:
+        xor rax, rax;                            // 0 = all recognised
         ret;
       }
     }
