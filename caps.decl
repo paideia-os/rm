@@ -1,68 +1,125 @@
 # rm — caps.decl
 #
-# Wave: R50 (Wave 2)
-# Doc:  design/tooling/r49-r50-plan.md §5.8 in the paideia-os repo.
+# Wave: R50 -> v1.1-A extraction -> v1.2.0 (Closes paideia-os/rm#28)
+# Doc:  design/architecture.md (v1.2.0 section) in this repo;
+#       design/round-retrospectives/r90-xrepo-wave3-plan.md
+#         §R90-XREPO.013.M3-005 in paideia-os.
 #
-# rm removes files. Its full cap footprint through R50 is four
-# kinds; every one is declared here at M1 so downstream milestones
-# (M2 recursive walk, M3 audit + undo record + elevate wire-up) are
-# body edits inside existing bodies rather than caps.decl churn.
+# Purpose
+# -------
+# This file is the invariant-I6 (capability handoff visible +
+# refusable) manifest the shell validates at exec: rm receives
+# exactly the caps below and no more. Missing a required cap in the
+# reconciled set is an exec refusal; extra caps in the received set
+# are dropped at cap_manifest_verify (libpdx-cap M2-001) before rm's
+# main body observes them.
 #
-#   * KIND_USER (0x190, paideia-os src/kernel/core/cap/kind_user.pdx)
-#     — rm runs as a delegated user; every target-file open, every
-#     trash-subtree write, every undo-record write, and every
-#     RemoveRecord audit tail carries the invoker's KIND_USER cap-
-#     tail (D3 audit-first in design/tooling/plan.md).
+# v1.2.0 (#28) — KIND_PDXFS_VOL adoption per R90-XREPO.013.M3-005
+# ----------------------------------------------------------------
 #
-#   * KIND_PDXFS_FILE (0x195, paideia-os src/kernel/core/cap/
-#     kind_pdxfs_file.pdx L82) narrowed to (write, <target-parent>).
-#     The scope is the parent directory of the target — the loader's
-#     InitCap sidecar (paideia-os src/kernel/core/loader/init_caps.
-#     pdx, R20b.M4-001) narrows the ambient KIND_PDXFS_FILE cap to
-#     the target's parent at exec so rm cannot touch a file outside
-#     the argv-supplied path. Cross-subtree targets and /system/
-#     targets require an elevate hop (M3-004); ambient write on the
-#     invoker's home subtree is what M1 declares.
+# R90-XREPO.013 (`design/round-retrospectives/r90-xrepo-wave3-plan.md`
+# §5) shifts cap-reconciliation to EXEC TIME: shell.M2-001 invokes
+# `sys_exec_reconcile_caps` for every child before returning control,
+# narrowing the ambient cap-set to what the child's `caps.decl`
+# declares. Every /bin coreutil (ls, cat, cp, mv, rm, mkdir, doc,
+# pkg) publishes a `caps.decl` under R90-XREPO.013.M3-* so the shell
+# performs the narrowing rather than granting the ambient set
+# unmodified. This file is the M3-005 rm entry.
 #
-#   * KIND_PDXFS_TXN (0x196, paideia-os src/kernel/core/cap/
-#     kind_pdxfs_txn.pdx L71) — the transaction cap. Every rm
-#     invocation opens exactly one TXN, moves the target into the
-#     trash subtree, and commits. Recursive rm (M2-001) reuses the
-#     same TXN for the leaf-first walk; the atomicity is a load-
-#     bearing invariant (I5 undo) and the reason a single TXN cap
-#     is declared at M1 rather than one per file.
+# The v1.2.0 rm surface is:
 #
-#   * KIND_IPC_ENDPOINT (5, paideia-os src/kernel/core/cap/kind.pdx
-#     L72; R20b base kind) — the pipe substrate. Declared at M1 so
-#     M3's RemoveRecord[] emission (via libpdx-semantic-pipe) and
-#     the audit-broker send (via libpdx-audit) do not need a caps.
-#     decl edit; the exec-time cap_manifest_verify at libpdx-cap
-#     M2-001 already sees the endpoint kind in the declared set.
+#   KIND_USER                                    -- identity root
+#   KIND_PDXFS_FILE (write, <target-parent>)     -- default-branch unlink
+#   KIND_PDXFS_FILE (rmdir, <target-parent>)     -- -r branch top-level rmdir
+#   KIND_PDXFS_VOL  (unlink, <target-parent>)    -- volume-level unlink-op cap
+#                                                   (declared; adoption arm
+#                                                    defers to the future
+#                                                    trash-move substrate)
+#   KIND_IPC_ENDPOINT                            -- semantic-pipe + audit
+#
+# The KIND_PDXFS_VOL row is a DECLARATION and an ADOPTION NOTE rather
+# than an active gate at v1.2.0. Grounds:
+#
+#   (1) R90-XREPO.013.M3-005 (paideia-os/rm#28) is the caps-manifest
+#       half of the R90 TXN adoption plan applied to rm. Adding the
+#       KIND_PDXFS_VOL row now (rather than at the future trash-move
+#       landing) means the manifest reconciler will not fail-fast
+#       with CAP_MANIFEST_MISSING when the trash-move body edit adds
+#       the first pdxfs_txn_open call site -- the cap is already
+#       declared; only the invoke happens later. The inverse ordering
+#       (add-cap-when-first-called) would take two coordinated
+#       releases across the InitCap sidecar packaging pipeline and
+#       the loader-side reconciler.
+#
+#   (2) The R90 substrate has landed in-kernel (sysnos 104 / 105 /
+#       107 for sys_pdxfs_txn_open / _commit / _abort per commits
+#       2111 / 2112 / 2113) but the userspace side (a KIND_PDXFS_VOL
+#       slot in rm's InitCap sidecar, plus the loader-side match
+#       against this file) is what R90-XREPO.013.M3-005 gates.
+#       Landing the declaration here without the invoke keeps that
+#       gate reachable while the trash-move landing owns the body
+#       edit.
+#
+#   (3) The manifest reconciler treats a DECLARED-but-not-INVOKED
+#       cap as informational, not as CAP_MANIFEST_EXTRA. See
+#       shell src/exec.pdx §exec_reconcile_publish for the ordering
+#       rules; the three-arm classification (missing / extra /
+#       declared) is R90-XREPO.013.M2-001 (paideia-os/shell#39).
+#
+# What v1.2.0 retires
+# -------------------
+#
+# The M5-era KIND_PDXFS_TXN row (declared at rm 1.0 M1 for a future
+# trash-move TXN) is DROPPED at v1.2.0: the R90 substrate uses
+# KIND_PDXFS_VOL as the volume-scoping arg, not KIND_PDXFS_TXN, so
+# preserving the retired row would land as CAP_MANIFEST_EXTRA at
+# exec-time reconciliation. Its provenance:
+#
+#   KIND_PDXFS_TXN    (retired)  -- was declared at M1 for the future
+#                                    trash-move TXN wrap; superseded
+#                                    by the volume-scoping form the
+#                                    R90 substrate uses.
 #
 # The elevate channel (KIND_ELEVATE_CHANNEL = 0x191, R48.M7 at
-# paideia-os src/kernel/core/ipc/elevate_channel.pdx) is NOT declared
-# at M1. Elevate is a per-operation request lodged when the target
-# is under /system/ or crosses the invoker's subtree; M3-004 wires
-# libpdx-elevate at that point. Ambient elevate authority would
-# violate D4 (destructive ops require per-op consent).
+# paideia-os src/kernel/core/ipc/elevate_channel.pdx) is still NOT
+# declared here at v1.2.0. Elevate is a per-operation request lodged
+# when the resolved target is under /system/ (rm v1.2.0 #19: gate now
+# runs on the sys_getcwd-resolved absolute path, not raw argv); the
+# RmElevate::elevate_check_and_request call opens the channel per-op
+# via libpdx-elevate, which does not require an ambient cap in rm's
+# declared set. Ambient elevate authority would violate D4.
 #
-# InitCap sidecar note. All four kinds above are seeded into rm's
-# cap_table at exec by the loader from the shell's InitCap sidecar
-# (paideia-os src/kernel/core/loader/init_caps.pdx). The shell
-# narrows the ambient KIND_PDXFS_FILE cap to the target-parent
-# scope before it hands the sidecar to sys_execve so ambient write
-# authority on /pdx/ never leaks into rm.
+# Path-resolution posture (v1.2.0 #19)
+# ------------------------------------
+#
+# The elevate gate at v1.2.0 runs on the sys_getcwd-joined absolute
+# path (RmResolve::resolve_target -> sys_getcwd sysno 86 + join into
+# _rm_resolved_scratch). The gate no longer sees raw argv bytes, so
+# `rm ../../system/passwd` and `rm foo` (from cwd == /system) both
+# fire the elevate hop correctly. Full ../ folding (a canonical
+# path resolver) remains R57 substrate work; the sys_unlink kernel
+# body itself walks the path via mount_root_vnode + path_resolve as
+# a defence-in-depth secondary layer.
+#
+# Semantic-pipe emit (v1.2.0 #22)
+# -------------------------------
+#
+# The KIND_IPC_ENDPOINT row covers both the M3-001 RemoveRecord@0.1
+# schema emit via libpdx-semantic-pipe AND the M3-002 audit-broker
+# send via libpdx-audit. v1.2.0 (#22) additionally fires these
+# hooks from RmWalk::walk_recursive for the -r top-level target
+# (previously only rm_process_one fired them). No new cap slot; the
+# existing declaration covers both call sites.
 
 requires:
   - KIND_USER
-  - KIND_PDXFS_FILE(write, <target-parent>)
-  - KIND_PDXFS_TXN
+  - KIND_PDXFS_FILE (write, <target-parent>)
+  - KIND_PDXFS_FILE (rmdir, <target-parent>)
+  - KIND_PDXFS_VOL  (unlink, <target-parent>)
   - KIND_IPC_ENDPOINT
 
-# Declared output schemas — the semantic-pipe schemas rm emits on
-# its stdout. M1 emits none (the first-runnable body prints text
-# only). M3-001 introduces RemoveRecord[] via libpdx-semantic-pipe
-# with fields path, size, was_dir, trash_handle; the name is pre-
-# declared here at M1 so consumers can inspect the manifest early.
+# Declared output schemas -- the semantic-pipe schemas rm emits on
+# its stdout. RemoveRecord@0.1 fires from rm_process_one's default
+# branch AND (v1.2.0 #22) from walk_recursive's -r top-level target.
 declares_output_schemas:
   - RemoveRecord@0.1

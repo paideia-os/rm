@@ -1,0 +1,35 @@
+// src/tool_ident.pdx -- rm v1.2.0 (Wave F drain: PDX_TOOL_NAME extern)
+// ToolIdent module: per-tool identity externs.
+//
+// Purpose
+// -------
+// libpdx-argv 1.1.3+ (ENH-032) reads two UND externs from every tool
+// linked against it -- PDX_TOOL_NAME (lowercase, NUL-terminated) and
+// PDX_TOOL_VERSION (semver, NUL-terminated) -- so its
+// VersionBackend::emit_default can render `<tool> <ver>` on
+// `--version` without hard-coding the tool identity into the shared
+// library. Every /bin coreutil publishes these two symbols so the
+// eventual libpdx-argv bump (^0.1 -> ^1.1) is a manifest edit rather
+// than a source edit.
+//
+// rm is on libpdx-argv @ ^0.1 at v1.2.0 (the ENH-032 UND-extern
+// contract has no effect on this version), but the symbols are
+// added preemptively so a later bump does not require touching this
+// file. Same discipline mkdir/cp/cat/mv follow.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module ToolIdent (PascalCase basename).
+//   - No function bodies -> no register plan, no encoder guardrails.
+//   - Array size == literal byte count INCLUDING NUL:
+//       "rm\0"    = 3 bytes
+//       "1.2.0\0" = 6 bytes
+//   - Both symbols `pub let` (public + immutable = .rodata) so the
+//     linker can resolve libpdx-argv's UND refs against them.
+
+module ToolIdent = structure {
+
+  pub let PDX_TOOL_NAME    : [u8; 3] = "rm\0"
+  pub let PDX_TOOL_VERSION : [u8; 6] = "1.2.0\0"
+
+}

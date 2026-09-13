@@ -19,7 +19,7 @@
 # pkgs.paideia-os/main/).
 
 name          = rm
-version       = 1.0.1
+version       = 1.2.0
 kind          = tool
 entry         = RmMain::rm_main
 output        = build-out/rm
@@ -43,13 +43,16 @@ sources:
   - src/print.pdx                 # sys_write(fd=1/2) helpers
   - src/flags.pdx                 # -r / -f / -v / --wipe / --dry-run scanner
   - src/remove.pdx                # rm_remove body (M2: iterate + dispatch)
-  - src/walk.pdx                  # RmWalk::walk_recursive (M2-001)
+  - src/walk.pdx                  # RmWalk::walk_recursive (M2-001 + v1.2.0 #22 M3 hooks)
   - src/retention.pdx             # RmRetention::retention_attach (M2-003)
-  - src/wipe.pdx                  # RmWipe::wipe_emit (M2-004)
+  - src/wipe.pdx                  # RmWipe::wipe_emit (M2-004 + v1.2.0 #32 pdxfs_unlink)
   - src/schema.pdx                # RmSchema: RemoveRecord@0.1 bind + emit (M3-001)
   - src/audit.pdx                 # RmAudit: audit_pre + audit_record_target + audit_post (M3-002)
   - src/undo.pdx                  # RmUndo: PdxFS v1 undo record composition (M3-003)
   - src/elevate.pdx               # RmElevate: /system/ elevate hop via libpdx-elevate (M3-004)
+  - src/resolve.pdx               # RmResolve: sys_getcwd + join (v1.2.0 #19)
+  - src/pdxfs.pdx                 # RmPdxfs: pdxfs_unlink/pdxfs_rmdir wrappers (v1.2.0 #32)
+  - src/tool_ident.pdx            # ToolIdent: PDX_TOOL_NAME/VERSION externs (Wave F)
   - src/main.pdx                  # rm_main(argc, argv) entry point
 
 # --- Library dependencies -----------------------------------------------

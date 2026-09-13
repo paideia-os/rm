@@ -96,7 +96,33 @@ module Remove = structure {
   // guarantees the broker is present; M3 preserves the substrate-
   // skeleton discipline where a HEAD run with no live broker still
   // completes cleanly). Reset each rm invocation via remove_reset.
+  //
+  // ENH-002 (#19) note: rm_blocked_by_elevate is ALSO bumped in
+  // rm_remove_body when RmResolve::resolve_target returns 0 (empty
+  // argv, sys_getcwd < 0, join overflow). Design/enhancement-plan.md
+  // §3 groups resolve-fail with elevate-fail as "target refused
+  // before dispatch"; the counter's semantics widen accordingly.
   pub let mut rm_blocked_by_elevate : u64 = uninit @align(8)
+
+  // -- v1.2.0 real-body observability (#32) -----------------------------
+  //
+  // rm_real_unlink_ok  -- bumped on a successful pdxfs_unlink return
+  //                        (rax == 0) from rm_process_one's default
+  //                        (non-wipe, non-dry-run) path. Also bumped
+  //                        from RmWipe::wipe_emit and
+  //                        RmWalk::walk_recursive after their own real
+  //                        syscall returns 0.
+  // rm_real_unlink_err -- bumped when pdxfs_unlink returns non-zero.
+  //                        A negative-errno u64 (rax >= 0x8000...) is
+  //                        counted here; the specific errno is not
+  //                        recorded per-slot (that lands with the M4
+  //                        smoke's per-scenario expected-errno list).
+  //
+  // Both reset per invocation via remove_reset. The sum
+  // (ok + err) equals the number of real-unlink call sites reached
+  // (removed_count minus dry_run_count minus blocked_count).
+  pub let mut rm_real_unlink_ok  : u64 = uninit @align(8)
+  pub let mut rm_real_unlink_err : u64 = uninit @align(8)
 
   // -- M2 output message pieces ----------------------------------------
   // The M1-003 four-part shape is preserved: (optional verbose prefix)
@@ -192,9 +218,9 @@ module Remove = structure {
   pub let remove_reset : () -> () !{mem, sysreg} @{cap, sched} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {cap, sched},
-      justification: "rm.M5-001 remove_reset (widens M3-004). Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count) AND the M3-004 rm_blocked_by_elevate counter AND the four M5-001 slots that close the reset-list gap M4-001 flagged (RmRetention::retention_attach_count, RmRetention::retention_deadline_ns, RmWalk::walk_invocations, RmWalk::walk_blocked_by_elevate), then delegate to each M3 module's own reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset, RmElevate::elevate_reset). RmRetention + RmWalk do not expose their own module reset — the four slots are the entirety of their observability surface, so the umbrella writes them directly rather than routing through a two-line callee. Delegation still keeps RmSchema/RmAudit/RmUndo/RmElevate .bss visibility internal. Effect tail !{mem, sysreg} @{cap, sched} unchanged from M3-004 (adding pure .bss writes here does not widen the callee tail sum). Prologue: sub rsp, 8 pad; entry rsp % 16 == 8 → post-sub rsp % 16 == 0 for the four nested calls. Matched add rsp, 8 before ret. r11 scratch for every .bss write; each lea writes to its slot before the next lea replaces r11 (no overlap). All immediates 0.",
+      justification: "rm v1.2.0 remove_reset (widens M5-001 with resolve_reset for #19). Zero the M1/M2 slots (removed_count, confirm_skips_by_f, confirm_prompts_stub, RmWipe::was_wiped_flag, RmWipe::wipe_count) AND the M3-004 rm_blocked_by_elevate counter AND the four M5-001 slots that close the M4-001 reset-list gap (RmRetention::retention_attach_count, RmRetention::retention_deadline_ns, RmWalk::walk_invocations, RmWalk::walk_blocked_by_elevate), then delegate to each M3+ module reset (RmSchema::schema_reset, RmAudit::audit_reset, RmUndo::undo_reset, RmElevate::elevate_reset, RmResolve::resolve_reset -- new at v1.2.0). Prologue: sub rsp, 8 pad; entry rsp%16 == 8 -> post-sub rsp%16 == 0 for the five nested calls. r11 scratch for every .bss write; each lea writes to its slot before the next lea replaces r11 (no overlap). All immediates 0.",
       block: {
-        sub rsp, 8;                                 // rsp%16: 8 → 0
+        sub rsp, 8;                                 // rsp%16: 8 -> 0
 
         xor rax, rax;
         lea r11, [rip + removed_count];             mov [r11], rax;
@@ -204,25 +230,21 @@ module Remove = structure {
         lea r11, [rip + was_wiped_flag];    mov [r11], rax;
         lea r11, [rip + wipe_count];        mov [r11], rax;
 
-        // M5-001: close the reset-list gap flagged in M4-001 —
-        // RmRetention (2 slots) + RmWalk (2 slots) had no module reset
-        // and were not covered by the M3 umbrella. Adding them here
-        // makes a re-entered rm process baseline in every slot the
-        // M4 smoke reads.
-        lea r11, [rip + retention_attach_count];
-        mov [r11], rax;
-        lea r11, [rip + retention_deadline_ns];
-        mov [r11], rax;
-        lea r11, [rip + walk_invocations];
-        mov [r11], rax;
-        lea r11, [rip + walk_blocked_by_elevate];
-        mov [r11], rax;
+        lea r11, [rip + retention_attach_count];    mov [r11], rax;
+        lea r11, [rip + retention_deadline_ns];     mov [r11], rax;
+        lea r11, [rip + walk_invocations];          mov [r11], rax;
+        lea r11, [rip + walk_blocked_by_elevate];   mov [r11], rax;
 
-        // Delegate to M3 module resets (M3-001/002/003/004).
+        // v1.2.0 real-body observability (#32).
+        lea r11, [rip + rm_real_unlink_ok];         mov [r11], rax;
+        lea r11, [rip + rm_real_unlink_err];        mov [r11], rax;
+
+        // Delegate to module resets (M3-001..004 + v1.2.0 resolve).
         call schema_reset;
         call audit_reset;
         call undo_reset;
         call elevate_reset;
+        call resolve_reset;
 
         add rsp, 8;
         ret;
@@ -346,12 +368,12 @@ module Remove = structure {
   pub let rm_remove_body : (u64) -> u64 !{mem, sysreg} @{} =
     fn (target_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.ENH-001 (issue #18) rm_remove_body. Iterates ParsedArgs::pos_ptrs[0..pos_count] and dispatches per-target on flag_r. The M1-era rdi=target_ptr argument is ignored (RmMain::rm_main still passes pos_ptrs[0] out of signature-compat with M1; the M2 body reads pos_ptrs itself so every positional beyond the first is also processed). SECURITY FIX #18: RmElevate::elevate_check_and_request now runs HERE, once per target, BEFORE the flag_r branch -- the single point where every target is in hand and no dispatch decision has been taken yet. This closes the -r bypass: previously the gate lived only inside rm_process_one, so RmWalk::walk_recursive (the flag_r==1 arm) never saw it. A refusal (rax != 0) skips dispatch entirely (no walk_recursive call, no rm_process_one call -- no print, no retention, no undo, no schema, no audit) and bumps the counter matching the arm that would have run (walk_blocked_by_elevate for flag_r==1, rm_blocked_by_elevate for flag_r==0) so the observability split from M3-004 is preserved. The call clobbers rdi (caller-saved), so pos_ptrs[i] is reloaded into rdi immediately after for the actual dispatch. 2-push prologue (r12=i, r13=pos_count) + sub rsp, 8 pad keeps rsp%16 == 0 at every nested call site (elevate_check_and_request, rm_process_one, RmWalk::walk_recursive). r12 + r13 preserved across each call by the SysV callee-save contract; elevate_check_and_request touches only rbx/rcx/r8/r9/r10/r11/rax, rm_process_one only rbx/r12(own frame), walk_recursive only rbx -- none touch the caller's r12/r13. All immediates in cmp are 0 or the pos_count bound (32, fits imm32 trivially). Every .bss read via lea r11, [rip + sym]. Return: pop pad, pop r13, pop r12, xor rax,rax, ret — exit code always EXIT_OK at M2-001 because the mutating substrate is not in-tree.",
+      justification: "rm v1.2.0 rm_remove_body (extends ENH-001/#18 with #19 resolve-then-gate). Iterates ParsedArgs::pos_ptrs[0..pos_count]. For every positional: (1) RmResolve::resolve_target absolutises the argv-ptr via sys_getcwd + join (returns 0 on empty/getcwd-fail/join-overflow); (2) RmElevate::elevate_check_and_request runs the /system/ prefix scan on the RESOLVED path (closes #19 -- gate no longer sees raw argv bytes); (3) dispatch on flag_r to walk_recursive or rm_process_one, passing the resolved pointer as target_ptr. Resolve fail (rax==0) is treated as a blocked target (bumps rm_blocked_by_elevate; skips dispatch). Elevate refusal (rax!=0) skips dispatch and bumps the counter matching the flag_r arm (walk_blocked_by_elevate for flag_r==1, rm_blocked_by_elevate otherwise). 3-push prologue (r12=i, r13=pos_count, r14=resolved_ptr) leaves rsp%16 == 0 at every nested call site (resolve_target, elevate_check_and_request, walk_recursive, rm_process_one -- entry %16==8, 3 pushes -> 0). All five SysV callee-save regs preserved across each call by the SysV contract. r14 holds the resolved pointer across the elevate call so dispatch does not need a second read from rm_resolved_ptr .bss. All immediates in cmp are 0 or the pos_count bound (32). Every .bss read via lea r11, [rip + sym]. Return: pop r14/r13/r12, xor rax,rax, ret -- exit code always EXIT_OK at v1.2.0 (per-target pdxfs_unlink failures are counted in rm_process_one's own tail; the process exit stays EXIT_OK to preserve the v1.0/v1.1 shape until the R42 substrate lands full trash-move error propagation).",
       block: {
-        // Prologue: preserve iteration state; align stack for nested calls.
-        push r12;                              // rsp%16: 8 → 0
-        push r13;                              // rsp%16: 0 → 8
-        sub rsp, 8;                            // rsp%16: 8 → 0
+        // Prologue: preserve iteration state + resolved pointer; align for nested calls.
+        push r12;                              // rsp%16: 8 -> 0
+        push r13;                              // rsp%16: 0 -> 8
+        push r14;                              // rsp%16: 8 -> 0
 
         // Initialise loop counter and bound.
         xor r12, r12;                          // i = 0
@@ -363,33 +385,49 @@ module Remove = structure {
         cmp r12, r13;
         jge rm_remove_loop_done;
 
-        // Load pos_ptrs[i] into rdi (elevate-check arg).
+        // Load pos_ptrs[i] into rdi (resolve arg).
         lea r11, [rip + pos_ptrs];
         mov rdi, [r11 + r12*8];
 
-        // ---- SECURITY (#18): single-site elevate gate, BEFORE the
-        //      flag_r dispatch decision. Covers both arms. ----------------
+        // ---- SECURITY (#19): resolve argv to absolute path FIRST. --
+        call resolve_target;                   // rax = resolved_ptr (0 on fail)
+        cmp rax, 0;
+        je  rm_remove_resolve_fail;
+        mov r14, rax;                          // r14 = resolved_ptr
+
+        // ---- SECURITY (#18/#19): elevate gate on RESOLVED path. ----
+        mov rdi, r14;
         call elevate_check_and_request;
         cmp rax, 0;                            // RE_PROCEED (0)
         jne rm_remove_blocked;
 
-        // Reload pos_ptrs[i] into rdi — the elevate call clobbered it.
-        lea r11, [rip + pos_ptrs];
-        mov rdi, [r11 + r12*8];
-
-        // Dispatch on flag_r. flag_r == 1 → recursive walk.
+        // Dispatch on flag_r. Pass resolved pointer as target_ptr.
         lea r11, [rip + flag_r];
         mov rax, [r11];
         cmp rax, 0;
         je rm_remove_call_process_one;
 
-        // Recursive branch. RmWalk::walk_recursive(target) → rax=0 at M2.
+        // Recursive branch: RmWalk::walk_recursive(resolved).
+        mov rdi, r14;
         call walk_recursive;
         jmp rm_remove_loop_advance;
 
       rm_remove_call_process_one:
-        // Non-recursive branch. rm_process_one(target) → rax=0 at M2.
+        // Non-recursive branch: rm_process_one(resolved).
+        mov rdi, r14;
         call rm_process_one;
+        jmp rm_remove_loop_advance;
+
+      rm_remove_resolve_fail:
+        // Resolve failed (empty argv, getcwd < 0, join overflow).
+        // Treat as blocked; bump rm_blocked_by_elevate as the closest
+        // observability slot (design/enhancement-plan.md §3 groups
+        // resolve-fail with elevate-fail as "target refused before
+        // dispatch").
+        lea r11, [rip + rm_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
         jmp rm_remove_loop_advance;
 
       rm_remove_blocked:
@@ -418,7 +456,7 @@ module Remove = structure {
 
       rm_remove_loop_done:
         // Epilogue: restore stack, return EXIT_OK.
-        add rsp, 8;                            // undo pad
+        pop r14;
         pop r13;
         pop r12;
         xor rax, rax;                          // EXIT_OK
@@ -644,6 +682,34 @@ module Remove = structure {
 
       rm_process_m2_suffix_print:
         call print_str;
+
+        // ---- v1.2.0 (#32) real-body: pdxfs_unlink on resolved path ----
+        // Only the default (non-wipe, non-dry-run) path reaches here.
+        // Wipe path jumps to rm_process_done_ok BEFORE M2 suffix and
+        // has its own pdxfs_unlink inside wipe_emit. Dry-run also
+        // bypasses this by jumping to done_ok before the M2 suffix.
+        //
+        // Args: rdi = rbx (resolved target_ptr), rsi = r12 (target_len).
+        // Return: 0 on success, negative-errno u64 on failure. The
+        // ok/err counters are the observability signal; the process
+        // exit stays EXIT_OK (v1.0/v1.1 shape preserved until the R42
+        // substrate lands full trash-move error propagation).
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdxfs_unlink;
+        cmp rax, 0;
+        jne rm_process_unlink_err;
+        lea r11, [rip + rm_real_unlink_ok];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp rm_process_done_ok;
+
+      rm_process_unlink_err:
+        lea r11, [rip + rm_real_unlink_err];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
         // fallthrough
 
       rm_process_done_ok:

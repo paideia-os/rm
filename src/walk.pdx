@@ -158,14 +158,31 @@ module Walk = structure {
   // Prologue: push rbx (rsp%16: 8 → 0). Epilogue: pop rbx, load
   // rax=0, ret. Same shape as RmRemove::rm_process_one.
   // ============================================================================
-  pub let walk_recursive : (u64) -> u64 !{mem, sysreg} @{} =
+  pub let walk_recursive : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
     fn (target_ptr: u64) -> unsafe {
-      effects: {mem, sysreg}, capabilities: {},
-      justification: "rm.M2-001 walk_recursive skeleton. Bumps walk_invocations so the M4 smoke matrix can distinguish a dispatched -r invocation from a bare fall-through, then emits a per-target line: (optional 'rm: ') + 'recursive walk of: ' + <target> + ('\\n' | WALK_STUB_SUFFIX). No real filesystem walk; the mutating PdxFS ops (sys_pdxfs_txn_open, sys_pdxfs_readdir with cursor, sys_pdxfs_move, sys_pdxfs_txn_commit) are R42 substrate work not in-tree — see the mv.M1-003 preamble in mv/src/rename.pdx and the cp.M1-003 dispatch skeleton in cp/src/dispatch.pdx for the same substrate-gap discipline. 1-push prologue (rbx) preserves target_ptr across four nested Print::print_str calls and aligns rsp%16 to 0. rdx is the NUL-walk cursor for the target-length compute; the walk uses the xor-rax + mov_b idiom per the #1248 mitigation. All immediates in cmp are 0 or single-byte chars. Every .bss / .rodata access via lea r11, [rip + sym]. Return: pop rbx, xor rax,rax, ret — always EXIT_OK at M2-001.",
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm v1.2.0 walk_recursive (extends M2-001 with #22 M3 hooks + #32 real body). Bumps walk_invocations, then emits the four-part line, then -- v1.2.0 additions -- (a) fires the M3 hook set for the TOP-LEVEL target (retention_attach + undo_write + record_emit + audit_record_target); (b) calls pdxfs_unlink on the resolved path, falling back to pdxfs_rmdir if unlink returned non-zero (handles directory-target case without needing the R42 recursive-walk substrate). Per-entry walk (readdir + per-child unlink under one TXN) remains R42 substrate work not in-tree; the top-level-target M3 hooks restore the D3 audit-first + I5 undoability invariants for the -r branch at the granularity available today (design/enhancement-plan.md §4 Finding C: 'the top-level target record ... is available today and restores the invariant's floor'). 2-push prologue (rbx=target_ptr, r12=target_len) + sub rsp, 8 pad keeps rsp%16 == 0 at every nested call site (four Print, four M3 hooks, two pdxfs syscalls -- entry %16==8, 2 pushes = 16 -> %16=0, sub 8 -> %16=8, wait: recount -- entry %16==8, push rbx -> %16=0, push r12 -> %16=8, sub 8 -> %16=0. Correct.). rbx + r12 preserved across every nested call by SysV callee-save. target_len computed FIRST (before any print) so it survives the print calls in r12. Encoder: no test rN,rN, no imm64 in cmp (single-byte chars only), byte loads via xor+mov_b (#1248). Labels prefixed walk_ to dodge reserved keywords. Return: add rsp,8, pop r12, pop rbx, xor rax,rax, ret -- always EXIT_OK.",
       block: {
-        // Prologue: preserve target_ptr across the four Print calls.
-        push rbx;                              // rsp%16: 8 → 0
+        // Prologue: preserve target_ptr + target_len across every hook.
+        push rbx;                              // rsp%16: 8 -> 0
+        push r12;                              // rsp%16: 0 -> 8
+        sub rsp, 8;                            // rsp%16: 8 -> 0
+
         mov rbx, rdi;                          // rbx = target_ptr
+
+        // ---- Compute target_len via NUL walk (once, stashed in r12) ----
+        mov rdx, rbx;
+      walk_len_top:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je walk_len_done;
+        add rdx, 1;
+        jmp walk_len_top;
+
+      walk_len_done:
+        mov r12, rdx;
+        sub r12, rbx;                          // r12 = target_len
 
         // Bump walk_invocations unconditionally so the counter records
         // every -r dispatch, not every successful walk.
@@ -191,29 +208,18 @@ module Walk = structure {
         call print_str;
 
         // ---- Part 3: print the target string ----------------------------
-        mov rdx, rbx;
-
-      walk_walk_target:
-        xor rax, rax;
-        mov_b rax, [rdx];
-        cmp rax, 0;
-        je walk_walk_done;
-        add rdx, 1;
-        jmp walk_walk_target;
-
-      walk_walk_done:
         mov rdi, rbx;
-        mov rsi, rdx;
-        sub rsi, rbx;
+        mov rsi, r12;
         call print_str;
 
-        // ---- Part 4: trailing suffix (dry-run → '\n'; else → WALK_STUB) -
+        // ---- Part 4: trailing suffix (dry-run -> '\n'; else -> WALK_STUB) -
         lea r11, [rip + flag_dry_run];
         mov rax, [r11];
         cmp rax, 0;
         je walk_print_stub;
 
-        // Dry-run: just a newline.
+        // Dry-run: just a newline. NO M3 hook and NO real syscall --
+        // dry-run is by design non-emitting/non-mutating.
         lea rdi, [rip + NEWLINE];
         mov rsi, 1;                            // NEWLINE_LEN
         call print_str;
@@ -223,10 +229,73 @@ module Walk = structure {
         lea rdi, [rip + WALK_STUB_SUFFIX];
         mov rsi, 55;                           // WALK_STUB_SUFFIX_LEN
         call print_str;
+
+        // ---- v1.2.0 (#22) M3 hooks for the TOP-LEVEL target -----------
+        // Restores D3 audit-first + I5 undoability for the -r branch at
+        // the granularity available without the R42 per-entry walk.
+
+        // retention_attach (populates retention_deadline_ns which
+        // undo_write snapshots below).
+        mov rdi, rbx;
+        call retention_attach;
+
+        // undo_write(target_ptr, target_len, was_dir=1, trash_handle=0).
+        // was_dir=1 is a conservative default for the -r branch (the
+        // top-level target is usually a directory; the R42 substrate
+        // transition upgrades this to a real stat lookup).
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;                            // was_dir = 1
+        xor rcx, rcx;                          // trash_handle = 0
+        call undo_write;
+
+        // record_emit(target_ptr, target_len, was_dir=1, trash_handle=0).
+        mov rdi, rbx;
+        mov rsi, r12;
+        mov rdx, 1;                            // was_dir = 1
+        xor rcx, rcx;                          // trash_handle = 0
+        call record_emit;
+
+        // audit_record_target(target_ptr).
+        mov rdi, rbx;
+        call audit_record_target;
+
+        // ---- v1.2.0 (#32) real-body: unlink then rmdir fallback --------
+        // Try unlink first (handles the file-target case, e.g.
+        // `rm -r foo.txt`); on non-zero return try rmdir (handles the
+        // empty-directory case). If both fail, count as err. Per-entry
+        // recursive walk of a non-empty directory remains R42 substrate
+        // work; the top-level attempt here is what v1.1-A extraction
+        // makes available today.
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdxfs_unlink;
+        cmp rax, 0;
+        je walk_unlink_ok;
+
+        mov rdi, rbx;
+        mov rsi, r12;
+        call pdxfs_rmdir;
+        cmp rax, 0;
+        je walk_unlink_ok;
+
+        lea r11, [rip + rm_real_unlink_err];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp walk_done_ok;
+
+      walk_unlink_ok:
+        lea r11, [rip + rm_real_unlink_ok];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
         // fallthrough
 
       walk_done_ok:
-        // Epilogue: restore rbx, load exit code 0.
+        // Epilogue: undo pad, restore r12 + rbx, load exit code 0.
+        add rsp, 8;
+        pop r12;
         pop rbx;
         xor rax, rax;                          // EXIT_OK
         ret;

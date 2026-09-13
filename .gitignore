@@ -1,0 +1,11 @@
+# rm — paideia-as build products
+#
+# `build-out/` is populated by `paideia-as build` (via tools/build.sh
+# in the parent paideia-os repo). Each build produces:
+#   build-out/rm         -- the elaborated .pdx -> ELF-like Paideia binary
+#   build-out/rm.caps    -- the caps.decl copy the loader consumes
+# plus any per-source .o intermediates the incremental build keeps.
+# None of these belong in git; the .release/ tree carries the signed
+# tarball produced by `paideia-as release --sign`.
+
+build-out/

@@ -5,6 +5,110 @@ Every rm release follows semver (design/tooling/plan.md §D4). The
 design/tooling/r49-r50-plan.md §5.8); every subsequent entry adds one
 line to the top under the same shape.
 
+## 1.2.0 — 2026-09-13
+
+Wave F drain: single implementation pass closing the five remaining
+open issues (rm#19, rm#20, rm#22, rm#28, rm#32). Two security fixes
+(elevate on resolved path, --wipe covered by the same gate), the -r
+audit-invisibility fix, R90-XREPO.013.M3-005 caps.decl adoption, and
+the parallel-to-cat/cp/mkdir v1.1-A real-body extraction.
+
+### Landed
+
+- **rm#19 (ENH-002) + rm#20 (ENH-003) — SECURITY: elevate gate on
+  resolved path.** New `RmResolve` module (`src/resolve.pdx`) with
+  `resolve_target(argv_ptr) -> resolved_ptr` that classifies the
+  argv first byte: `/` -> absolute fast path (returns argv_ptr +
+  strlen), NUL -> degenerate (returns 0), anything else -> calls
+  `sys_getcwd` (sysno 86, R86.M1-003 kernel body) into
+  `_rm_cwd_scratch` and joins `cwd + '/' + argv` into
+  `_rm_resolved_scratch`, returning the join pointer. Two 256-byte
+  .bss scratches match the kernel-side `SYS_GETCWD_PATH_MAX` (256)
+  and `SYS_UNLINK_PATH_MAX-1` (255). `RmRemove::rm_remove_body` now
+  runs `resolve_target` FIRST in the loop, THEN
+  `elevate_check_and_request` on the resolved pointer (r14 preserves
+  it across the elevate call). The resolved pointer is passed as
+  `target_ptr` to `walk_recursive` / `rm_process_one`, so every
+  downstream consumer (elevate, unlink, undo, audit, schema) sees
+  the same canonicalised bytes. This closes both #19 (`rm foo` from
+  cwd `/system/` and `rm ../../system/passwd` no longer bypass the
+  gate) and #20 (--wipe on /system now correctly requires elevate;
+  --wipe outside /system correctly does not, matching D4). Full
+  `../` folding remains R57 substrate work; the sys_unlink body's
+  own `mount_root_vnode + path_resolve` is the defence-in-depth
+  secondary layer.
+  - `src/resolve.pdx` — new module.
+  - `src/remove.pdx` — `rm_remove_body` grew a 3-push prologue
+    (r12=i, r13=pos_count, r14=resolved_ptr) with no pad; the
+    resolve-then-gate ordering is now the single-site security
+    invariant. Resolve-fail (rax==0) bumps `rm_blocked_by_elevate`
+    and skips dispatch (the counter's semantics widened per the
+    file comment). `remove_reset` delegates to `resolve_reset`.
+
+- **rm#22 (ENH-005) — `-r` path emits M3 records.** `walk_recursive`
+  now fires the four M3 hooks (`retention_attach` +
+  `undo_write` + `record_emit` + `audit_record_target`) for the
+  top-level target after the WALK_STUB_SUFFIX print. The prologue
+  widened from 1-push (rbx) to 2-push (rbx, r12) + 8 pad so
+  `target_len` (computed once via a NUL walk up-front) survives
+  every nested call. Per-entry recursive walk remains R42 substrate
+  work; the top-level-target hop restores the D3 audit-first and
+  I5 undoability invariants for the -r branch at the granularity
+  available today per design/enhancement-plan.md §4.
+
+- **rm#28 (R90-XREPO.013.M3-005) — caps.decl adoption.** Added
+  `KIND_PDXFS_VOL(unlink, <target-parent>)` row (declared, adoption
+  arm defers to the future trash-move substrate landing) and
+  `KIND_PDXFS_FILE(rmdir, <target-parent>)` for the -r branch top-
+  level rmdir. Retired the M5-era `KIND_PDXFS_TXN` row (superseded
+  by the volume-scoping form the R90 substrate uses). Long adoption
+  note in `caps.decl` mirrors the cp/mkdir §M3-006/M3-003 shape:
+  declaration keeps the manifest reconciler's gate reachable while
+  the trash-move landing owns the invoke.
+
+- **rm#32 — v1.1-A real-body extraction.** New `RmPdxfs` module
+  (`src/pdxfs.pdx`) with two syscall trampolines: `pdxfs_unlink`
+  (sysno 81, R56.M3-005) and `pdxfs_rmdir` (sysno 80, R56.M3-004).
+  Both are leaves with the SysV rdi/rsi -> SYSCALL arg convention.
+  Wired at three call sites:
+  - `RmRemove::rm_process_one` default-path tail (after M2 stub
+    suffix print) calls `pdxfs_unlink(rbx, r12)` on the resolved
+    path. Dry-run and --wipe paths bypass via their own earlier
+    `jmp rm_process_done_ok`.
+  - `RmWipe::wipe_emit` calls `pdxfs_unlink` on the resolved path
+    after the WIPE_STUB_SUFFIX print. Byte-overwrite
+    (sys_pdxfs_secdisc) remains R42 substrate; was_wiped_flag +
+    undo_write_count=0 forensic invariant preserved.
+  - `RmWalk::walk_recursive` tries `pdxfs_unlink` first, falling
+    back to `pdxfs_rmdir` if unlink returned non-zero (handles both
+    file and empty-directory top-level targets without needing the
+    R42 recursive-walk substrate).
+  - Two new .bss observability slots in `RmRemove`:
+    `rm_real_unlink_ok` / `rm_real_unlink_err`. Zeroed by
+    `remove_reset`; bumped at every real-syscall return. The
+    process exit stays EXIT_OK on syscall failure to preserve the
+    v1.0/v1.1 shape until the R42 substrate lands full trash-move
+    error propagation.
+
+- **Wave F support scaffolding.**
+  - `src/tool_ident.pdx` — new module declaring `PDX_TOOL_NAME =
+    "rm\0"` and `PDX_TOOL_VERSION = "1.2.0\0"` externs preemptively
+    for the eventual libpdx-argv >= 1.1.3 bump (ENH-032 UND-extern
+    contract). Same discipline mkdir/cp/cat/mv follow.
+  - `manifest.pdxproj` — version bumped 1.0.1 -> 1.2.0. Sources
+    list gained resolve.pdx, pdxfs.pdx, tool_ident.pdx.
+  - `.gitignore` — new file, ignores `build-out/`.
+
+### Substrate + release notes carried forward
+
+- The three substrate gaps documented under 1.0.0 (PdxFS v1 mutating
+  trash-move ops, `sys_pdxfs_undo_append`, signing bot host) remain
+  open; v1.2.0 lands the real-body extraction that IS available
+  (sys_unlink + sys_rmdir + sys_getcwd landed at R56 / R86), not
+  the trash-move substrate which is R42 work.
+- `manifest.pdxsig` regeneration deferred to the signing bot host
+  landing; the sig block footprint is unchanged in size.
+
 ## 1.0.1 — 2026-09-12
 
 Patch release closing enhancement-v1.x issue #25 (`rm.ENH-007`). The

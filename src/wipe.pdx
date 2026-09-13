@@ -189,6 +189,47 @@ module Wipe = structure {
         mov rsi, 67;                           // WIPE_STUB_SUFFIX_LEN
         call print_str;
 
+        // (7) v1.2.0 (#32) real-body: pdxfs_unlink on the resolved
+        // target. --wipe skips the trash-subtree move (no trash entry,
+        // no retention, no undo -- see the file-header interaction
+        // notes), so the syscall is issued directly. Byte-overwrite
+        // (sys_pdxfs_secdisc) remains R42 substrate work; the M4
+        // "wipe forensic" invariant is asserted by was_wiped_flag=1
+        // plus undo_write_count=0 across the invocation, both of
+        // which still hold after this call.
+        //
+        // Recompute target_len via NUL walk (rdx above was clobbered
+        // by print_str). Cheap: the resolved-path cap is 255 bytes.
+        mov rdx, rbx;
+      wipe_ulen_top:
+        xor rax, rax;
+        mov_b rax, [rdx];
+        cmp rax, 0;
+        je  wipe_ulen_done;
+        add rdx, 1;
+        jmp wipe_ulen_top;
+
+      wipe_ulen_done:
+        mov rdi, rbx;
+        mov rsi, rdx;
+        sub rsi, rbx;
+        call pdxfs_unlink;
+        cmp rax, 0;
+        jne wipe_unlink_err;
+        lea r11, [rip + rm_real_unlink_ok];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        jmp wipe_done;
+
+      wipe_unlink_err:
+        lea r11, [rip + rm_real_unlink_err];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        // fallthrough
+
+      wipe_done:
         // Epilogue.
         pop rbx;
         ret;

@@ -1,0 +1,337 @@
+// src/resolve.pdx -- rm v1.2.0 (Closes paideia-os/rm#19)
+// RmResolve module: absolute-path resolver via sys_getcwd + join.
+//
+// Scope (v1.2.0)
+// --------------
+// rm 1.0/1.1's elevate gate compared the raw argv bytes against the
+// literal "/system/" prefix, so `rm ../../system/passwd` and
+// `rm foo` (from cwd == /system) both slipped past the gate
+// unresolved. Enhancement-plan §3 (Finding B) marked this as a
+// SECURITY defect (issue #19) and named it as the same class as the
+// -r bypass (#18, closed at v1.1). #20 (--wipe takes no elevate hop
+// on non-/system) is a shared consequence: once the gate operates on
+// the RESOLVED path, --wipe under /system correctly requires
+// elevate, and --wipe outside /system correctly does not.
+//
+// The v1.1-A cwd substrate landed in-kernel at R86.M1-003 (paideia-
+// os #1956) with sys_getcwd (sysno 86, ring-3 shape:
+// rdi=buf_va, rsi=buf_len, rax = bytes-written-including-NUL or
+// -errno). mkdir v1.1-B (paideia-os/mkdir#25) and cp v1.1-B
+// (paideia-os/cp#21) are the shape references.
+//
+// Contract
+// --------
+// resolve_target(argv_ptr) -> resolved_ptr
+//
+// Behaviour:
+//   argv[0] == '/'   -> ABSOLUTE. Returns argv_ptr verbatim; publishes
+//                        argv_ptr + strlen(argv_ptr) to
+//                        rm_resolved_ptr / rm_resolved_len.
+//   argv[0] == NUL   -> DEGENERATE. Returns 0; publishes 0/0.
+//   any other byte   -> RELATIVE. Calls sys_getcwd into _rm_cwd_scratch,
+//                        joins cwd + '/' + argv[i] into _rm_resolved_scratch,
+//                        publishes &_rm_resolved_scratch + join_len, returns
+//                        &_rm_resolved_scratch.
+//
+// The .bss buffers are single-flow: `resolve_target` is called once
+// per positional in the RmRemove loop, and the .bss slots survive
+// only until the next call. Consumers that need the resolved bytes
+// across another resolve call must snapshot them (rm_remove_body does
+// not; it uses the resolved pointer only within the same loop
+// iteration).
+//
+// Path normalisation (../ folding) is a POST-v1.2 concern -- the
+// full canonicaliser lands with the R57 substrate expansion. At
+// v1.2 the elevate gate remains defence-in-depth: the //system/
+// prefix scan on the cwd-joined path catches `rm foo` from
+// /system/... (Finding B primary case), and `rm ../..//system/x`
+// still slips past the prefix scan but goes through sys_unlink
+// which itself walks the path via mount_root_vnode + path_resolve
+// (kernel-side canonicalisation). Documented in caps.decl adoption
+// note under v1.2.0.
+//
+// paideia-as compliance (v0.36+ encoder discipline)
+// -------------------------------------------------
+//   - Module RmResolve (PascalCase basename matches src/resolve.pdx).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (max seen: 256).
+//   - r11 is scratch (used for every lea).
+//   - Byte loads use xor rax, rax; mov_b rax, [ptr] per the #1248
+//     mitigation.
+//   - Labels prefixed rm_resolve_ to dodge paideia-as reserved
+//     keywords (loop, if, let, fn, pub, mut, struct, unsafe, block).
+
+module Resolve = structure {
+
+  // -- Syscall id (mirror of dispatch.pdx sysno 86 landing) -----------
+  pub let SYSCALL_GETCWD : u64 = 86
+
+  // -- Path-length cap. Matches SYS_GETCWD_PATH_MAX (256) and the
+  //    sys_unlink_body path-scratch cap (255 + NUL) so the join buffer
+  //    can safely feed pdxfs_unlink/pdxfs_rmdir.
+  pub let PATH_MAX_BYTES : u64 = 255
+
+  // -- .bss scratch buffers + published resolution ---------------------
+  //
+  // _rm_cwd_scratch      -- sys_getcwd destination (256B matches
+  //                          SYS_GETCWD_PATH_MAX in the kernel header).
+  // _rm_resolved_scratch -- join buffer (256B matches
+  //                          SYS_UNLINK_PATH_MAX-1 + NUL).
+  // rm_resolved_ptr      -- published pointer to the resolved bytes.
+  //                          Either argv_ptr (absolute case) or
+  //                          &_rm_resolved_scratch (relative case).
+  // rm_resolved_len      -- byte length (NUL excluded).
+  // rm_resolve_errors    -- bumped whenever sys_getcwd returned <0 or
+  //                          the join would overflow PATH_MAX_BYTES.
+  //                          Observability signal for the M4 smoke;
+  //                          the caller distinguishes "resolve failed"
+  //                          from "resolved OK" via rm_resolved_ptr == 0.
+  pub let mut _rm_cwd_scratch      : [u8; 256] = uninit @align(8)
+  pub let mut _rm_resolved_scratch : [u8; 256] = uninit @align(8)
+  pub let mut rm_resolved_ptr      : u64       = uninit @align(8)
+  pub let mut rm_resolved_len      : u64       = uninit @align(8)
+  pub let mut rm_resolve_errors    : u64       = uninit @align(8)
+
+  // ============================================================================
+  // resolve_reset()
+  //
+  // Signature: resolve_reset : () -> () !{mem} @{}
+  //
+  // Zero the three observability slots. Called from RmRemove::remove_reset
+  // so a fresh rm_main invocation starts baseline. Scratch buffers not
+  // scrubbed -- resolve_target overwrites them per positional.
+  // ============================================================================
+  pub let resolve_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm v1.2.0 resolve_reset. Zero the three observability slots (rm_resolved_ptr, rm_resolved_len, rm_resolve_errors) so a fresh rm_main invocation starts baseline. Scratch buffers (_rm_cwd_scratch, _rm_resolved_scratch) not scrubbed -- resolve_target overwrites them fully per positional. xor rax,rax produces the zero constant; three lea+mov pairs write it. r11 is scratch. Leaf function; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + rm_resolved_ptr];   mov [r11], rax;
+        lea r11, [rip + rm_resolved_len];   mov [r11], rax;
+        lea r11, [rip + rm_resolve_errors]; mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // resolve_target(argv_ptr) -> resolved_ptr
+  //
+  // Signature: resolve_target : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input):  argv_ptr -- NUL-terminated path (from pos_ptrs[i])
+  // RAX (output): resolved_ptr:
+  //                 argv_ptr             on absolute-path fast path
+  //                 &_rm_resolved_scratch on relative-path resolve
+  //                 0                    on any failure (empty argv,
+  //                                       sys_getcwd < 0, join overflow)
+  //
+  // Register plan (1-push prologue + 8-byte pad):
+  //   rbx = argv_ptr    (preserved across the getcwd syscall)
+  //   r12 = user_len    (strlen of argv_ptr; preserved across the copy)
+  //   r13 = cwd_len     (sys_getcwd return - 1)
+  //   [rsp+0] = pad     (keeps rsp%16 == 0 at the SYSCALL site)
+  //   rcx, rdx, rax, r8, r9, r10, r11 = scratch
+  //
+  // Entry rsp % 16 == 8 (SysV). push rbx -> 0. push r12 -> 8. push r13
+  // -> 0. sub rsp, 8 -> 8 [wait, that's not aligned]... let me recount.
+  //
+  // Actually: entry rsp%16 == 8. push rbx: 8-8 = 0 mod 16. push r12:
+  // 0-8 = 8. push r13: 8-8 = 0. No extra pad needed -- three pushes
+  // land us at 0 for the SYSCALL. No sub rsp needed.
+  // ============================================================================
+  pub let resolve_target : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (argv_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm v1.2.0 resolve_target (Closes paideia-os/rm#19). Classifies argv[0]: NUL -> return 0 (degenerate empty argv); '/' -> absolute fast path, publishes argv_ptr + strlen, returns argv_ptr; anything else -> relative path, calls sys_getcwd (sysno 86, R86.M1-003 kernel body sys_getcwd.pdx) into _rm_cwd_scratch with buf_len=256, copies cwd+'/'+argv into _rm_resolved_scratch, publishes &_rm_resolved_scratch + join_len, returns &_rm_resolved_scratch. Failure classes (sys_getcwd < 0, join overflow > PATH_MAX_BYTES) bump rm_resolve_errors + return 0; caller (rm_remove_body) treats 0 as blocked. 3-push prologue (rbx=argv_ptr, r12=user_len, r13=cwd_len) aligns rsp%16 for the SYSCALL (entry %16==8 -> 3*8=24 -> 8+24=32 -> %16==0). All five SysV callee-save regs preserved by the SYSCALL contract; rbx/r12/r13 stay live across every nested op. Inline bounded strlen(argv_ptr) uses xor+mov_b per #1248. Separator byte inserted only when cwd != '/' (rcx guard: cwd_len==1 && cwd[0]=='/' -> no sep). Byte copies via base+index SIB addressing (mov_b rax,[rsi+rcx*1]; mov_b [rdi+rcx*1],rax) proven at mkdir_cpy_cwd_top L419+. Encoder discipline: no test rN,rN (all zero-checks via cmp reg,0), no and rN,imm64 on r8-r15, no 2-op imul, every cmp immediate <= 256 fits imm16. r11 scratch across every lea/imm-stage; no overlap with syscall clobbers because r11 is written afresh after each SYSCALL. Labels prefixed rm_resolve_ to dodge reserved keywords.",
+      block: {
+        // Prologue: 3-push aligns rsp%16 to 0 for the syscall.
+        push rbx;                              // rsp%16: 8 -> 0
+        push r12;                              // rsp%16: 0 -> 8
+        push r13;                              // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                          // rbx = argv_ptr
+
+        // ---- Classify argv[0] --------------------------------------
+        xor rax, rax;
+        mov_b rax, [rbx];
+        cmp rax, 0;
+        je  rm_resolve_empty;
+        cmp rax, 0x2F;                         // '/'
+        je  rm_resolve_absolute;
+
+        // ---- Relative path: sys_getcwd + join ----------------------
+
+        // sys_getcwd(&_rm_cwd_scratch, 256)
+        lea rdi, [rip + _rm_cwd_scratch];
+        mov rsi, 256;
+        mov rax, 86;                           // SYSCALL_GETCWD
+        syscall;
+
+        // rax < 0 -> failure. Signed compare on a u64: sign-bit set
+        // means negative-errno. Test via cmp rax, 0; jl requires the
+        // signed sense. Use cmp with 0 and jl.
+        cmp rax, 0;
+        jl  rm_resolve_fail;
+        cmp rax, 0;
+        je  rm_resolve_fail;                   // 0 bytes -> also fail
+
+        // cwd_len = rax - 1 (excluding NUL).
+        mov r13, rax;
+        sub r13, 1;
+
+        // ---- Inline bounded strlen(rbx); cap at PATH_MAX_BYTES -----
+        xor r12, r12;
+      rm_resolve_ulen_top:
+        cmp r12, 255;                          // PATH_MAX_BYTES
+        jae rm_resolve_fail;
+        xor rax, rax;
+        mov rcx, rbx;
+        add rcx, r12;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je  rm_resolve_ulen_done;
+        add r12, 1;
+        jmp rm_resolve_ulen_top;
+
+      rm_resolve_ulen_done:
+        // ---- Determine separator: 0 iff cwd is exactly '/'. -------
+        mov r10, 1;
+        cmp r13, 1;
+        jne rm_resolve_sep_done;
+        lea r11, [rip + _rm_cwd_scratch];
+        xor rdx, rdx;
+        mov_b rdx, [r11];
+        cmp rdx, 0x2F;                         // '/'
+        jne rm_resolve_sep_done;
+        xor r10, r10;                          // cwd == "/" -> sep = 0
+
+      rm_resolve_sep_done:
+        // total_len = cwd_len + sep + user_len; must fit <= 255.
+        mov rdx, r13;
+        add rdx, r10;
+        add rdx, r12;
+        cmp rdx, 255;
+        ja  rm_resolve_fail;
+
+        // ---- Copy cwd bytes into resolved scratch ------------------
+        xor rcx, rcx;
+      rm_resolve_cpy_cwd_top:
+        cmp rcx, r13;
+        jae rm_resolve_cpy_cwd_done;
+        lea r11, [rip + _rm_cwd_scratch];
+        xor rax, rax;
+        mov r8, r11;
+        add r8, rcx;
+        mov_b rax, [r8];
+        lea r11, [rip + _rm_resolved_scratch];
+        mov r9, r11;
+        add r9, rcx;
+        mov_b [r9], rax;
+        add rcx, 1;
+        jmp rm_resolve_cpy_cwd_top;
+
+      rm_resolve_cpy_cwd_done:
+        // ---- Optional separator byte -------------------------------
+        cmp r10, 0;
+        je  rm_resolve_cpy_user_start;
+        lea r11, [rip + _rm_resolved_scratch];
+        mov r9, r11;
+        add r9, r13;                           // r9 = &resolved[cwd_len]
+        mov rax, 0x2F;                         // '/'
+        mov_b [r9], rax;
+
+      rm_resolve_cpy_user_start:
+        // cursor into resolved = cwd_len + sep
+        mov r8, r13;
+        add r8, r10;
+        xor rcx, rcx;                          // src index into argv
+      rm_resolve_cpy_user_top:
+        cmp rcx, r12;
+        jae rm_resolve_cpy_user_done;
+        mov r9, rbx;
+        add r9, rcx;
+        xor rax, rax;
+        mov_b rax, [r9];
+        lea r11, [rip + _rm_resolved_scratch];
+        mov r9, r11;
+        add r9, r8;
+        mov_b [r9], rax;
+        add r8, 1;
+        add rcx, 1;
+        jmp rm_resolve_cpy_user_top;
+
+      rm_resolve_cpy_user_done:
+        // NUL-terminate at r8.
+        lea r11, [rip + _rm_resolved_scratch];
+        mov r9, r11;
+        add r9, r8;
+        xor rax, rax;
+        mov_b [r9], rax;
+
+        // Publish resolved pointer + length.
+        lea r11, [rip + _rm_resolved_scratch];
+        lea r9, [rip + rm_resolved_ptr];
+        mov [r9], r11;
+        lea r9, [rip + rm_resolved_len];
+        mov [r9], r8;
+
+        mov rax, r11;                          // return &_rm_resolved_scratch
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_resolve_absolute:
+        // ---- Absolute path: publish argv_ptr + strlen -------------
+        xor r12, r12;
+      rm_resolve_alen_top:
+        cmp r12, 255;
+        jae rm_resolve_fail;
+        xor rax, rax;
+        mov rcx, rbx;
+        add rcx, r12;
+        mov_b rax, [rcx];
+        cmp rax, 0;
+        je  rm_resolve_alen_done;
+        add r12, 1;
+        jmp rm_resolve_alen_top;
+
+      rm_resolve_alen_done:
+        lea r11, [rip + rm_resolved_ptr];
+        mov [r11], rbx;
+        lea r11, [rip + rm_resolved_len];
+        mov [r11], r12;
+        mov rax, rbx;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_resolve_empty:
+        // Degenerate empty argv -- publish 0/0, return 0.
+        xor rax, rax;
+        lea r11, [rip + rm_resolved_ptr];  mov [r11], rax;
+        lea r11, [rip + rm_resolved_len];  mov [r11], rax;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+      rm_resolve_fail:
+        // sys_getcwd < 0 or join overflow -> bump errors, publish 0/0.
+        lea r11, [rip + rm_resolve_errors];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        xor rax, rax;
+        lea r11, [rip + rm_resolved_ptr];  mov [r11], rax;
+        lea r11, [rip + rm_resolved_len];  mov [r11], rax;
+        xor rax, rax;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+}

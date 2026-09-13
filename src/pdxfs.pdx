@@ -1,0 +1,113 @@
+// src/pdxfs.pdx -- rm v1.2.0 (Closes paideia-os/rm#32)
+// Pdxfs module: sys_unlink (sysno 81) + sys_rmdir (sysno 80) trampolines.
+//
+// Scope (v1.2.0)
+// --------------
+// rm 1.0/1.1 emitted the SHAPE of the future substrate call but never
+// invoked it. R56.M3-004/005 landed sys_rmdir (sysno 80) and
+// sys_unlink (sysno 81) in-kernel (paideia-os #1793 / #1794) with the
+// two-arg ring-3 shape `(path_va, path_len) -> 0 | -errno`. v1.2.0
+// extracts the real body: two trampolines here, wired at the call
+// sites in `RmRemove::rm_process_one`, `RmWipe::wipe_emit`, and
+// `RmWalk::walk_recursive`.
+//
+// Parallel to cat v1.1-A (sys_open/read/write/close), mkdir v1.1-A
+// (sys_mkdir), and cp v1.1-A (six-syscall extraction). Same
+// "real-body" discipline: the trampoline is a leaf, no shim, no
+// mocking layer.
+//
+// Return-value convention (verbatim from src/kernel/core/syscall/
+// sys_unlink.pdx + sys_rmdir.pdx):
+//   0        on success
+//   -EFAULT  (-14) walker rejected the user path
+//   -EINVAL  (-22) empty / root / no-slash path (sys_unlink only)
+//   -ENOENT  (-2)  no such file / parent
+//   -EIO     (-5)  backend I/O failure
+//   -EISDIR  (-21) sys_unlink refused a directory (use sys_rmdir)
+//
+// Trash-move semantics
+// --------------------
+// rm's v1.0 body describes a trash-subtree move that lets `undo rm`
+// recover an entry within the 24h retention window. That substrate
+// (sys_pdxfs_move + trash-subtree) is still R42 work. v1.2.0's real
+// body IMMEDIATELY unlinks the target -- no trash entry, no
+// recoverable state. This is the same posture cat/cp/mkdir took at
+// v1.1-A extraction: land the syscall we have; the trash-move
+// upgrade is a separate future edit inside these same call sites,
+// changing pdxfs_unlink to sys_pdxfs_move without touching the
+// caller. RmUndo::undo_write still composes the 6-lane undo record
+// for the audit-log invariant even though the trash entry does not
+// exist; the M3 -> substrate transition ties the two together.
+//
+// paideia-as compliance (v0.36+ encoder discipline)
+// -------------------------------------------------
+//   - Module Pdxfs (PascalCase basename matches src/pdxfs.pdx).
+//   - Leaf trampolines: no callee-save touched, no push/pop parity,
+//     no cross-module calls.
+//   - sysreg effect for the SYSCALL clobber (rcx, r11 per the amd64
+//     fast-syscall convention).
+//   - Every immediate <= 0x7FFFFFFF (max seen: 81).
+//   - No byte loads, no cmp instructions in either trampoline.
+//   - No branch labels -> no reserved-label prefix required.
+
+module Pdxfs = structure {
+
+  // -- Syscall ids ----------------------------------------------------
+  // Mirror src/kernel/core/syscall/dispatch.pdx (paideia-os):
+  //   80 = sys_rmdir (rsi=path_va, rdx=path_len)
+  //   81 = sys_unlink (rsi=path_va, rdx=path_len)
+  // dispatch_rmdir / dispatch_unlink SysV-shuffle rsi->rdi, rdx->rsi
+  // before the body call, so the ring-3 shape from userspace is
+  // rdi=path_va, rsi=path_len at SYSCALL.
+  pub let SYSCALL_UNLINK : u64 = 81
+  pub let SYSCALL_RMDIR  : u64 = 80
+
+  // ============================================================================
+  // pdxfs_unlink(path_va, path_len) -> u64
+  //
+  // Signature: pdxfs_unlink : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input):  path_va  -- VA of the path bytes (NUL-terminated;
+  //                          sys_unlink_body walks up to path_len
+  //                          bytes for the walker cap)
+  // RSI (input):  path_len -- byte length hint; capped at 255 kernel-side
+  // RAX (output): 0 on success, -EFAULT/-EINVAL/-ENOENT/-EISDIR/-EIO
+  //               as negative-errno u64 on failure.
+  //
+  // Register plan (leaf; syscall is the only nested op):
+  //   rax = syscall id / return
+  //   rcx, r11 = SYSCALL-clobbered per amd64 fast-syscall convention
+  //   rdi, rsi = caller args, pass through to SYSCALL unchanged
+  // ============================================================================
+  pub let pdxfs_unlink : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_va: u64) (path_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm v1.2.0 pdxfs_unlink (Closes paideia-os/rm#32). Trampoline for paideia-os sysno 81 (sys_unlink) landed by R56.M3-005 (#1794). SysV arg1=rdi(path_va) + arg2=rsi(path_len) map straight onto the SYSCALL arg registers (arity 2, no r10 shuffle needed). Return value verbatim from the syscall: 0 on success, or negative-errno u64 (-EFAULT=-14 walker refused, -EINVAL=-22 empty/root, -ENOENT=-2 no such file, -EISDIR=-21 target is a directory -- caller should call pdxfs_rmdir, -EIO=-5 backend failure). Leaf; sysreg effect for the SYSCALL clobber (rcx, r11). No push/pop parity to preserve (leaf with only a SYSCALL op). Encoder discipline (feedback_pdx_encoder_pitfalls): no test rN,rN, no and rN,imm64 on r8-r15, no 2-op imul, no wide cmp imm (81 fits imm8). No branch labels -> no reserved-label prefix required.",
+      block: {
+        mov rax, 81;                       // SYSCALL_UNLINK
+        syscall;
+        ret
+      }
+    }
+
+  // ============================================================================
+  // pdxfs_rmdir(path_va, path_len) -> u64
+  //
+  // Signature: pdxfs_rmdir : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input):  path_va  -- VA of the path bytes
+  // RSI (input):  path_len -- byte length hint
+  // RAX (output): 0 on success, -EFAULT/-ENOENT/-EIO as negative-errno u64.
+  //
+  // Register plan identical to pdxfs_unlink; the syscall id is the
+  // only difference.
+  // ============================================================================
+  pub let pdxfs_rmdir : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (path_va: u64) (path_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm v1.2.0 pdxfs_rmdir (Closes paideia-os/rm#32). Trampoline for paideia-os sysno 80 (sys_rmdir) landed by R56.M3-004 (#1793). SysV arg1=rdi(path_va) + arg2=rsi(path_len) map straight onto the SYSCALL arg registers. Return: 0 on success, negative-errno u64 on failure (-EFAULT=-14 walker refused, -ENOENT=-2 no such directory, -EIO=-5 backend failure or directory not empty). Leaf; sysreg for the SYSCALL clobber. Encoder discipline as pdxfs_unlink (80 fits imm8).",
+      block: {
+        mov rax, 80;                       // SYSCALL_RMDIR
+        syscall;
+        ret
+      }
+    }
+}
