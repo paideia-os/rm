@@ -66,6 +66,22 @@ module Remove = structure {
   pub let EXIT_USAGE          : u64 = 2
   pub let EXIT_NOT_YET_IMPL   : u64 = 3
 
+  // rm.ENH-004 (rm#21) SECURITY fix: EACCES-equivalent exit code. A
+  // blocked-by-elevate removal used to fall through the loop and
+  // return EXIT_OK (0) unconditionally -- fail-OPEN reporting: a
+  // caller (or a script checking $?) had no signal that anything was
+  // refused. rm_remove_body now checks the two block counters
+  // (rm_blocked_by_elevate + walk_blocked_by_elevate) after the loop
+  // and returns EXIT_EACCES (13, matching POSIX EACCES) whenever
+  // either is non-zero for this invocation.
+  pub let EXIT_EACCES         : u64 = 13
+
+  // rm.ENH-004 (rm#21) diagnostic emitted on stderr at every block
+  // site (resolve-fail, recursive-blocked, non-recursive-blocked)
+  // inside rm_remove_body's loop. 28 bytes.
+  pub let ENH004_BLOCKED_MSG     : [u8; 28] = "[rm.ENH-004 EACCES blocked]\n"
+  pub let ENH004_BLOCKED_MSG_LEN : u64      = 28
+
   // -- Per-invocation counter ------------------------------------------
   // Bumped by rm_process_one on every entry (one bump per positional
   // target processed by the non-recursive branch). Reset each rm
@@ -239,12 +255,14 @@ module Remove = structure {
         lea r11, [rip + rm_real_unlink_ok];         mov [r11], rax;
         lea r11, [rip + rm_real_unlink_err];        mov [r11], rax;
 
-        // Delegate to module resets (M3-001..004 + v1.2.0 resolve).
+        // Delegate to module resets (M3-001..004 + v1.2.0 resolve +
+        // rm.LE-002/#30 rm_r_cap).
         call schema_reset;
         call audit_reset;
         call undo_reset;
         call elevate_reset;
         call resolve_reset;
+        call rm_r_cap_reset;
 
         add rsp, 8;
         ret;
@@ -342,9 +360,14 @@ module Remove = structure {
   //              rm_main. At M2 this argument is IGNORED; the body
   //              iterates ParsedArgs::pos_ptrs[0..pos_count] directly
   //              so every positional is dispatched.
-  // RAX (output): 0 (EXIT_OK) — M2-001 always succeeds. Substrate-
-  //               real error codes (EXIT_OP_FAIL) become reachable
-  //               when the PdxFS mutating ops land.
+  // RAX (output): 0 (EXIT_OK) on a clean run; 13 (EXIT_EACCES,
+  //               rm.ENH-004 / rm#21 SECURITY fix) iff any positional
+  //               this invocation processed was refused before
+  //               dispatch (resolve-fail or elevate-block). Prior to
+  //               ENH-004 every path returned EXIT_OK unconditionally
+  //               — a blocked removal reported success (fail-OPEN).
+  //               Substrate-real per-target error codes (EXIT_OP_FAIL)
+  //               become reachable when the PdxFS mutating ops land.
   //
   // Iteration: for i in 0..pos_count:
   //   target = pos_ptrs[i]
@@ -407,9 +430,14 @@ module Remove = structure {
         cmp rax, 0;
         je rm_remove_call_process_one;
 
-        // Recursive branch: RmWalk::walk_recursive(resolved).
+        // Recursive branch: rm.LE-002 (rm#30) routes through RmRCap::
+        // rm_r_cap_wrap(resolved), which derives a per-directory
+        // sub-cap (ElevateClient::elevate_client_cap_derive) around
+        // the RmWalk::walk_recursive call and tears the whole derived
+        // sub-tree down (elevate_client_cap_revoke_cascade) once the
+        // walk returns -- see src/rm_r_cap.pdx.
         mov rdi, r14;
-        call walk_recursive;
+        call rm_r_cap_wrap;
         jmp rm_remove_loop_advance;
 
       rm_remove_call_process_one:
@@ -428,6 +456,9 @@ module Remove = structure {
         mov rax, [r11];
         add rax, 1;
         mov [r11], rax;
+        lea rdi, [rip + ENH004_BLOCKED_MSG];
+        mov rsi, 28;                           // ENH004_BLOCKED_MSG_LEN
+        call print_err;
         jmp rm_remove_loop_advance;
 
       rm_remove_blocked:
@@ -442,6 +473,9 @@ module Remove = structure {
         mov rax, [r11];
         add rax, 1;
         mov [r11], rax;
+        lea rdi, [rip + ENH004_BLOCKED_MSG];
+        mov rsi, 28;                           // ENH004_BLOCKED_MSG_LEN
+        call print_err;
         jmp rm_remove_loop_advance;
 
       rm_remove_blocked_nonrecursive:
@@ -449,17 +483,41 @@ module Remove = structure {
         mov rax, [r11];
         add rax, 1;
         mov [r11], rax;
+        lea rdi, [rip + ENH004_BLOCKED_MSG];
+        mov rsi, 28;                           // ENH004_BLOCKED_MSG_LEN
+        call print_err;
 
       rm_remove_loop_advance:
         add r12, 1;
         jmp rm_remove_loop_head;
 
       rm_remove_loop_done:
+        // rm.ENH-004 (rm#21) SECURITY fix: fail-closed exit code. If
+        // ANY target this invocation processed was refused before
+        // dispatch (resolve-fail or elevate-block, either dispatch
+        // arm), return EXIT_EACCES instead of the pre-fix EXIT_OK.
+        // No `add reg, [mem]` (encoder discipline) -- both counters
+        // are loaded into registers before being summed.
+        lea r11, [rip + rm_blocked_by_elevate];
+        mov rax, [r11];
+        lea r11, [rip + walk_blocked_by_elevate];
+        mov r10, [r11];
+        add rax, r10;
+        cmp rax, 0;
+        jne rm_remove_loop_blocked;
+
         // Epilogue: restore stack, return EXIT_OK.
         pop r14;
         pop r13;
         pop r12;
         xor rax, rax;                          // EXIT_OK
+        ret;
+
+      rm_remove_loop_blocked:
+        pop r14;
+        pop r13;
+        pop r12;
+        mov rax, 13;                           // EXIT_EACCES
         ret;
       }
     }

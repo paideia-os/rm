@@ -1,0 +1,264 @@
+// src/pdxfs_txn.pdx -- rm.R90 (rm#31)
+// PdxfsTxn module: userspace trampolines for the R90 PdxFS-v1 TXN
+// substrate's mutating ops.
+//
+// Scope
+// -----
+// R90-XREPO.010 landed the PdxFS-v1 transaction substrate in-kernel
+// (paideia-os design/user/syscall-table.md rows 70/104/105/107; kernel
+// commits #2111/#2112/#2113). This module is rm's userspace-side wire
+// for the ops rm's own trash-move / undo-staging path needs: open a
+// TXN, stage an undo pre-image, commit, or abort. Same shape as the
+// mv repo's src/pdxfs.pdx (six-syscall extraction precedent) and
+// rm's own src/pdxfs.pdx (v1.2.0 #32 sys_unlink/sys_rmdir extraction)
+// -- a straight-line trampoline per syscall, no shim, no mocking
+// layer, real body for every sysno that has actually landed.
+//
+// Sysno correction from the R90-XREPO.013 dispatch note
+// -------------------------------------------------------
+// The wave dispatch that named this file's scope cited sysnos 70,
+// 105, 107, 108, 109, 110 for begin/add_unlink/commit/abort/status/
+// free. Cross-checking design/user/syscall-table.md (the authoritative
+// R90-XREPO.010 landing record) against src/kernel/core/syscall/
+// dispatch.pdx shows that citation conflated two unrelated sysno
+// bands: 108/109/110 are R105's `display_enumerate` / `framebuffer_
+// create` / `framebuffer_map` (graphics substrate, landed in a later,
+// unrelated wave), not PdxFS ops. The actual R90-XREPO.010 PdxFS TXN
+// band is:
+//
+//   70   pdxfs_txn_open   (vol_slot, flags)                  -- LANDED
+//   104  pdxfs_txn_commit (cap_slot)                          -- LANDED
+//   105  pdxfs_txn_abort  (cap_slot)                          -- LANDED
+//   107  pdxfs_undo_write (cap_slot, inode_no, offset, len,
+//                          kbuf_ptr)                          -- LANDED
+//
+// There is no landed `pdxfs_txn_status` (row-state query) or
+// `pdxfs_txn_free` (row release) syscall at HEAD: design/user/
+// syscall-table.md row 104's own note says explicitly "Row release +
+// cap-slot clear are DEFERRED to a future sys_pdxfs_txn_close", and no
+// row-state query sysno exists anywhere in the table. This module
+// therefore lands FOUR real trampolines (begin/add_unlink/commit/
+// abort, wired to the actual sysnos 70/107/104/105) and TWO STUBs
+// (status/free) named to match the six-verb shape the dispatch asked
+// for, so a future `sys_pdxfs_txn_close` / row-state-query landing is
+// a one-line body edit at each STUB rather than a new call-site sweep
+// across every consumer. This mirrors mv's own established discipline
+// (src/pdxfs.pdx: real trampolines for landed sysnos side-by-side with
+// STUB trampolines for ops the substrate has not exposed yet).
+//
+// pdxfs_txn_add_unlink naming
+// ----------------------------
+// The kernel's landed op at sysno 107 is `pdxfs_undo_write`: stage a
+// pre-image snapshot of `[offset, offset+len)` of `inode_no` into the
+// TXN row BEFORE the corresponding mutation, so `sys_pdxfs_txn_abort`
+// can replay it in reverse to restore the pre-image. For rm's use
+// case -- staging the pre-image of a file about to be unlinked so an
+// abort can restore it -- this IS the "add an undo-covered unlink to
+// the open TXN" primitive the dispatch's `add_unlink` name describes;
+// the trampoline here is named to match that call-site vocabulary
+// while forwarding verbatim to the real `pdxfs_undo_write` syscall.
+//
+// Not wired into rm_process_one / walk_recursive at this landing
+// -----------------------------------------------------------------
+// Same posture mv's own pdxfs.pdx STUB-vs-real split takes: landing
+// the trampolines is this issue's scope ("R90 kernel-substrate wire
+// for mutating PdxFS ops... same shape as mv#34"); rewiring
+// RmRemove::rm_process_one / RmWalk::walk_recursive's existing direct
+// Pdxfs::pdxfs_unlink / pdxfs_rmdir call sites onto a TXN-wrapped
+// begin/add_unlink/commit/abort sequence is a follow-up body edit at
+// those call sites, not a signature or caps.decl change here (the
+// KIND_PDXFS_VOL row caps.decl already declares per R90-XREPO.013.
+// M3-005, v1.2.0 #28, covers this adoption).
+//
+// paideia-as compliance
+// ---------------------
+//   - Module PdxfsTxn (PascalCase basename matches src/pdxfs_txn.pdx
+//     after the numeric-prefix strip rule -- this file has none).
+//   - No test mnemonic; no zero-checks needed in leaf trampolines.
+//   - Every `cmp reg, imm` uses imm <= 0x7FFFFFFF. No compares here
+//     (every trampoline is unconditional straight-line code).
+//   - No byte reads; every trampoline forwards u64 args verbatim.
+//   - r10 is the only non-argument register touched, and only for the
+//     SysV-rcx-to-syscall-r10 shuffle on the arity-5 add_unlink call.
+//   - All six trampolines are LEAF functions -- no push/pop parity.
+//     rsp % 16 == 8 on entry stays 8 through the syscall itself; the
+//     kernel dispatch aligns internally (same discipline as rm's own
+//     src/pdxfs.pdx and mv's src/pdxfs.pdx).
+
+module PdxfsTxn = structure {
+
+  // -- Syscall numbers (mirror design/user/syscall-table.md; see the
+  //    file-header sysno-correction note above). ----------------------
+  pub let SYS_PDXFS_TXN_OPEN   : u64 = 70
+  pub let SYS_PDXFS_TXN_COMMIT : u64 = 104
+  pub let SYS_PDXFS_TXN_ABORT  : u64 = 105
+  pub let SYS_PDXFS_UNDO_WRITE : u64 = 107
+
+  // ==========================================================================
+  // pdxfs_txn_begin(vol_slot, flags) -> txn_slot_or_errno
+  //
+  // Signature: pdxfs_txn_begin : (u64, u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input):  vol_slot -- KIND_PDXFS_VOL cap slot the TXN opens
+  //               against (see caps.decl's KIND_PDXFS_VOL row).
+  // RSI (input):  flags    -- open-mode flags (kernel-side row shape;
+  //               opaque bitmask to this trampoline).
+  // RAX (output): fresh KIND_PDXFS_TXN cap slot (>= 0) on success,
+  //               negative-errno u64 on failure.
+  //
+  // Real syscall (sysno 70), landed R90-XREPO.010.M1-003 (paideia-os
+  // #2111 lineage; see design/user/syscall-table.md row 70). Arity 2,
+  // no r10 shuffle.
+  // ==========================================================================
+  pub let pdxfs_txn_begin : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (vol_slot: u64) (flags: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_begin trampoline. Real syscall (sysno 70 = sys_pdxfs_txn_open, design/user/syscall-table.md row 70; landed R90-XREPO.010). SysV arg1=rdi(vol_slot) + arg2=rsi(flags) map straight onto the SYSCALL arg registers -- arity 2, no r10 shuffle needed. Return: fresh KIND_PDXFS_TXN cap slot on success, negative-errno u64 on failure. Leaf; sysreg effect for the SYSCALL clobber (rcx, r11 per the amd64 fast-syscall convention). No push/pop parity to preserve. Encoder discipline: no test rN,rN, no wide cmp imm (no cmp at all in this leaf), no byte loads. No branch labels -> no reserved-label prefix required.",
+      block: {
+        mov rax, 70;                       // SYS_PDXFS_TXN_OPEN
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_add_unlink(txn_slot, inode_no, offset, len, kbuf_ptr)
+  //   -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_add_unlink : (u64, u64, u64, u64, u64) -> u64
+  //                                   !{mem, sysreg} @{}
+  // RDI (input):  txn_slot  -- KIND_PDXFS_TXN cap slot from
+  //               pdxfs_txn_begin.
+  // RSI (input):  inode_no  -- inode about to be unlinked.
+  // RDX (input):  offset    -- start of the pre-image range to stage.
+  // RCX (input):  len       -- length of the pre-image range; kernel
+  //               bounds 0 < len <= 4064 (design/user/syscall-table.md
+  //               row 107).
+  // R8  (input):  kbuf_ptr  -- pre-image source buffer. The dispatch
+  //               shim performs the KPTI bounce for user callers (row
+  //               107's own note), so a plain user-space pointer here
+  //               is correct -- no manual bounce needed at this call
+  //               site.
+  // RAX (output): 0 on success, negative-errno u64 on failure
+  //               (-EBADF bad slot, -EINVAL row not OPEN / len OOR,
+  //               -ENOSPC per-row buffer or record-cap exhausted).
+  //
+  // Real syscall (sysno 107 = sys_pdxfs_undo_write). Arity 5: SysV
+  // rcx (arg4 = len) maps to syscall r10 -- the same shuffle pdxfs_
+  // link (mv/src/pdxfs.pdx) and sys_rename (mv) already establish for
+  // arity >= 4; arg5 (kbuf_ptr) stays in r8, untouched by the
+  // shuffle. MUST be called BEFORE the corresponding mutation --
+  // sys_pdxfs_txn_abort replays every staged record in reverse order
+  // to restore each pre-image (row 107's documented contract).
+  // ==========================================================================
+  pub let pdxfs_txn_add_unlink : (u64, u64, u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_slot: u64) (inode_no: u64) (offset: u64) (len: u64) (kbuf_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_add_unlink trampoline. Real syscall (sysno 107 = sys_pdxfs_undo_write, design/user/syscall-table.md row 107; landed R90-XREPO.010.M1-004, paideia-os #2112 lineage). Named add_unlink at rm's call-site vocabulary (stage the pre-image of a file about to be unlinked so a TXN abort can restore it) while forwarding verbatim to the real undo-write syscall -- see file header 'pdxfs_txn_add_unlink naming'. Arity 5 requires the SysV-rcx-to-syscall-r10 shuffle (`mov r10, rcx`) for arg4 (len); arg5 (kbuf_ptr) stays in r8, which SYSCALL does not clobber. kbuf_ptr is a plain user-space pointer -- the dispatch shim performs the KPTI bounce for user callers per row 107's own documented split, so no manual bounce is needed at this call site. Return: 0 on success, negative-errno u64 on failure (-EBADF bad cap slot, -EINVAL row not OPEN or len outside (0, 4064], -ENOSPC per-row buffer/record-cap exhausted). MUST be called before the corresponding mutation -- sys_pdxfs_txn_abort replays every staged record in reverse to restore each pre-image. Leaf; sysreg for the SYSCALL clobber. No push/pop parity to preserve.",
+      block: {
+        mov r10, rcx;                      // SysV rcx -> syscall r10 (arg4 = len)
+        mov rax, 107;                      // SYS_PDXFS_UNDO_WRITE
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_commit(txn_slot) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_commit : (u64) -> u64 !{mem, sysreg} @{}
+  // RDI (input):  txn_slot -- KIND_PDXFS_TXN cap slot.
+  // RAX (output): 0 on success, negative-errno u64 on failure
+  //               (-EBADF on a bad cap slot; underlying journal /
+  //               transition sentinels forwarded verbatim).
+  //
+  // Real syscall (sysno 104), landed R90-XREPO.010.M1-003 (paideia-os
+  // #2111 lineage; design/user/syscall-table.md row 104). Arity 1, no
+  // shuffle. Row release + cap-slot clear are DEFERRED to a future
+  // sys_pdxfs_txn_close -- see pdxfs_txn_free below.
+  // ==========================================================================
+  pub let pdxfs_txn_commit : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_commit trampoline. Real syscall (sysno 104 = sys_pdxfs_txn_commit, design/user/syscall-table.md row 104; landed R90-XREPO.010.M1-003, paideia-os #2111 lineage). Arity 1, no r10 shuffle. Return: 0 on success, negative-errno u64 on failure (-EBADF bad cap slot; journal/transition sentinels forwarded verbatim). Row release + cap-slot clear are DEFERRED to a future sys_pdxfs_txn_close per the table row's own note -- see pdxfs_txn_free's STUB below. Leaf; sysreg for the SYSCALL clobber.",
+      block: {
+        mov rax, 104;                      // SYS_PDXFS_TXN_COMMIT
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_abort(txn_slot) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_abort : (u64) -> u64 !{mem, sysreg} @{}
+  // Same shape as commit; the kernel replays every staged undo record
+  // (pdxfs_txn_add_unlink above) in reverse order before transitioning
+  // the row OPEN -> ABORTED.
+  //
+  // Real syscall (sysno 105), landed R90-XREPO.010.M1-003 (paideia-os
+  // #2111 lineage; design/user/syscall-table.md row 105). Arity 1, no
+  // shuffle.
+  // ==========================================================================
+  pub let pdxfs_txn_abort : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_abort trampoline. Real syscall (sysno 105 = sys_pdxfs_txn_abort, design/user/syscall-table.md row 105; landed R90-XREPO.010.M1-003, paideia-os #2111 lineage). Arity 1, no r10 shuffle. Return: 0 on success, negative-errno u64 on failure (-EBADF bad cap slot). The kernel replays every pre-image staged via sys_pdxfs_undo_write (pdxfs_txn_add_unlink above) in reverse order before transitioning the row OPEN -> ABORTED, per row 107's documented contract. Leaf; sysreg for the SYSCALL clobber.",
+      block: {
+        mov rax, 105;                      // SYS_PDXFS_TXN_ABORT
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_status(txn_slot) -> state_or_errno
+  //
+  // Signature: pdxfs_txn_status : (u64) -> u64 !{mem, sysreg} @{}
+  //
+  // STUB. No row-state-query syscall exists in design/user/syscall-
+  // table.md at HEAD -- the R90-XREPO.010 landing exposes open/
+  // commit/abort/undo-write but no query op. Returns a fixed "OPEN"
+  // sentinel (1) so a caller threading the six-verb shape through a
+  // stub configuration sees a stable, documented placeholder rather
+  // than an invented negative-errno that could be mistaken for a real
+  // kernel refusal. When a future landing exposes a real query sysno,
+  // this becomes a one-line `mov rax, SYSNO; syscall; ret` body edit
+  // -- no signature change, no call-site sweep.
+  // ==========================================================================
+  pub let PXT_STATUS_OPEN_STUB : u64 = 1
+
+  pub let pdxfs_txn_status : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_status. STUB -- no row-state-query syscall exists in design/user/syscall-table.md at HEAD (the R90-XREPO.010 landing exposes open/commit/abort/undo-write only; see file header sysno-correction note). Returns PXT_STATUS_OPEN_STUB (1, 'OPEN') unconditionally so a caller threading the six-verb begin/add_unlink/commit/abort/status/free shape through a stub configuration observes a stable, documented placeholder rather than an invented negative-errno a caller could mistake for a real kernel refusal. sysreg effect declared for shape stability across the eventual real-syscall body edit (a query landing swaps this to `mov rax, SYSNO; syscall; ret` with no signature change). Leaf; no push/pop parity, txn_slot argument unused by the stub body (argument retained for signature stability across the future body edit).",
+      block: {
+        mov rax, 1;                        // STUB: PXT_STATUS_OPEN_STUB
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pdxfs_txn_free(txn_slot) -> 0_or_errno
+  //
+  // Signature: pdxfs_txn_free : (u64) -> u64 !{mem, sysreg} @{}
+  //
+  // STUB. design/user/syscall-table.md row 104's own note states row
+  // release + cap-slot clear are "DEFERRED to a future sys_pdxfs_txn_
+  // close" -- no such syscall exists at HEAD. Returns 0 (success)
+  // unconditionally so a caller that commits/aborts then unconditionally
+  // frees sees a clean 0 rather than an invented refusal; the cap slot
+  // itself is reclaimed by the kernel's own cap-table teardown at
+  // process exit in the interim (no leak across a single-process rm
+  // invocation's lifetime). When sys_pdxfs_txn_close lands, this
+  // becomes a one-line `mov rax, SYSNO; syscall; ret` body edit.
+  // ==========================================================================
+  pub let pdxfs_txn_free : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (txn_slot: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "rm.R90 (rm#31) pdxfs_txn_free. STUB -- design/user/syscall-table.md row 104's own note defers row release + cap-slot clear to a future sys_pdxfs_txn_close, which does not exist at HEAD (see file header sysno-correction note). Returns 0 (PDXFS_OK) unconditionally; the underlying cap slot is reclaimed by the kernel's own cap-table teardown at process exit in the interim, so no leak is observable across a single rm invocation's lifetime. sysreg effect declared for shape stability across the eventual real-syscall body edit. Leaf; txn_slot argument unused by the stub body (retained for signature stability).",
+      block: {
+        xor rax, rax;                      // STUB: PDXFS_OK
+        ret
+      }
+    }
+}

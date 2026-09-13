@@ -107,7 +107,9 @@ module Main = structure {
   // Signature: rm_main : (u64, u64) -> u64 !{mem, sysreg} @{}
   // RDI (input): argc — number of argv entries
   // RSI (input): argv — pointer to a u64 array of NUL-terminated arg ptrs
-  // RAX (output): exit code (0 ok / 1 op-fail / 2 usage)
+  // RAX (output): exit code (0 ok / 1 op-fail / 2 usage / 13 eacces —
+  //               rm.ENH-004, rm#21: RmRemove::rm_remove_body's
+  //               fail-closed return when a target was blocked)
   //
   // Register plan (2-push + 8-byte reserved pad frame):
   //   rbx = argv        (preserved across every nested call)

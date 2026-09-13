@@ -1,0 +1,314 @@
+// src/rm_r_cap.pdx -- rm.LE-002 (rm#30)
+// RmRCap module: cap_derive + revoke_cascade wrapper around the
+// recursive `-r` walk.
+//
+// Scope
+// -----
+// libpdx-elevate's ENH-003 (#15) design note names `rm -r` verbatim as
+// the case study its scope/budget primitives exist for: "one grant
+// covering N objects is accidental and unbounded" is "the `rm -r`
+// regression's root shape". LE-002 closes the structural half of that
+// finding for rm's own recursive branch: before RmWalk::walk_recursive
+// runs, RmRCap acquires a ROOT elevate grant scoping this one
+// recursive invocation, derives a CHILD sub-cap from it via
+// ElevateClient::elevate_client_cap_derive (the "per-directory
+// sub-cap" the walk operates under), then tears the whole derived
+// tree down via ElevateClient::elevate_client_cap_revoke_cascade the
+// instant the walk returns -- success or failure.
+//
+// Why one derived child, not one per directory
+// ---------------------------------------------
+// The real per-directory descent (live sys_pdxfs_readdir walking an
+// actual subtree) is R42 substrate work not yet in-tree --
+// RmWalk::walk_recursive's own file header documents this: at HEAD it
+// processes exactly one top-level target per invocation, not a live
+// recursive readdir. "Per-directory sub-cap" is therefore, at this
+// milestone, a per-INVOCATION sub-cap: RmRCap derives exactly one
+// child from the root per rm_r_cap_wrap call. The wrapper shape
+// (acquire root -> derive child -> run walk -> cascade root) survives
+// the R42 substrate landing unchanged: a future walk_recursive body
+// edit that descends into N real subdirectories derives N children
+// from the SAME root this wrapper already acquires, and the single
+// revoke_cascade(root) call at teardown already tears down an
+// arbitrarily deep derived tree (see elevate_client_cap_revoke_
+// cascade's own doc: "force-revoke row_id and every transitive
+// shadow-map descendant, deepest-first") -- no signature change is
+// needed at that landing, only a body edit inside walk_recursive.
+//
+// Fail-closed posture (ties into rm.ENH-004, rm#21)
+// --------------------------------------------------
+// If either the root acquire or the child derive refuses, rm_r_cap_
+// wrap does NOT run walk_recursive at all, and bumps RmWalk::
+// walk_blocked_by_elevate -- the SAME counter RmRemove::rm_remove_
+// body already reads to decide EXIT_EACCES vs EXIT_OK. A cap failure
+// on the recursive branch therefore surfaces through the identical
+// fail-closed exit-code path rm#21 landed for the elevate gate,
+// rather than a silent EXIT_OK from a walk that never ran.
+//
+// mint_ctx_ptr layouts
+// ---------------------
+// elevate_client_acquire's mint_ctx_buf is 5 words / 40 bytes: [+0]
+// parent_ep_slot, [+8] request_id, [+16] requester_pid, [+24]
+// target_cap_kind, [+32] target_cap_rights (see that function's file
+// header in libpdx-elevate). elevate_client_cap_derive's mint_ctx_ptr
+// is a DIFFERENT, smaller 3-word / 24-byte buffer: [+0] parent_ep_
+// slot, [+8] request_id, [+16] requester_pid -- target_cap_kind /
+// target_cap_rights are settled by derive's own semantics (fixed at
+// ELCC_KIND_ELEVATE_CHANNEL, derived from child_caps), not read from
+// this buffer. RmRCap keeps two distinct .bss scratches matching
+// each shape rather than reusing one truncated buffer for both.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmRCap (PascalCase basename matches file stem after the
+//     numeric-prefix strip rule -- this file has no numeric prefix).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (16 for the ELCC_MAX_ROWS
+//     bound is the largest immediate compared).
+//   - No `add reg, [mem]` anywhere; every add is reg+imm or reg+reg.
+//   - r11 is scratch for every lea targeting this module's own .bss;
+//     r10 is scratch for the mint_ctx buffer bases (disjoint use from
+//     r11 at every site, never live simultaneously).
+//   - Byte loads: none (this module touches only u64 fields).
+//   - rm_r_cap_wrap prologue: 2-push (rbx, r12) + sub rsp, 8 pad = 24
+//     bytes; entry rsp % 16 == 8, post-prologue rsp % 16 == 0 for
+//     every nested call site.
+//   - Labels prefixed `rmrcap_` (reserved-word discipline).
+
+module RmRCap = structure {
+
+  // -- Result codes (documentary; the loop-level caller discards the
+  //    return today -- see rm_remove_body's recursive dispatch arm --
+  //    but a future consumer gets a real discriminant for free). ----
+  pub let RMRCAP_OK               : u64 = 0
+  pub let RMRCAP_ERR_ACQUIRE_FAIL : u64 = 1
+  pub let RMRCAP_ERR_DERIVE_FAIL  : u64 = 2
+
+  // Mirrors of libpdx-elevate ElevateClientCap constants (duplicated
+  // here per this codebase's existing cross-module mirroring
+  // discipline -- see RmElevate::ELCC_KIND_ELEVATE_CHANNEL for the
+  // same pattern).
+  pub let ELCC_KIND_ELEVATE_CHANNEL : u64 = 0x191
+  pub let ELCC_RIGHTS_ALL           : u64 = 0x418
+  pub let ELCC_MAX_ROWS             : u64 = 16
+
+  // Relative lifetime (ns) requested for the ROOT grant this wrapper
+  // acquires. 5 seconds -- generous for a single rm -r invocation's
+  // wall-clock, bounded so a stuck walk cannot hold the grant
+  // indefinitely. Exceeds imm32 (0x7FFFFFFF ns ~= 2.147s) so every
+  // load of this value uses a plain `mov reg, imm64` (not a `cmp`,
+  // which paideia-as sign-extends at imm32 -- see the module-level
+  // encoder-discipline note).
+  pub let RMRCAP_ROOT_DUR_NS : u64 = 5000000000
+
+  // -- .bss scratch buffers + observability counters ---------------
+  pub let mut _rmrcap_req_buf          : [u64; 32] = uninit @align(8)
+  pub let mut _rmrcap_reply_buf        : [u64; 32] = uninit @align(8)
+  pub let mut _rmrcap_acquire_mint_ctx : [u64; 5]  = uninit @align(8)
+  pub let mut _rmrcap_derive_mint_ctx  : [u64; 3]  = uninit @align(8)
+
+  pub let mut rmrcap_acquires_ok  : u64 = uninit @align(8)
+  pub let mut rmrcap_acquires_err : u64 = uninit @align(8)
+  pub let mut rmrcap_derives_ok   : u64 = uninit @align(8)
+  pub let mut rmrcap_derives_err  : u64 = uninit @align(8)
+  pub let mut rmrcap_cascades     : u64 = uninit @align(8)
+
+  // ============================================================================
+  // rm_r_cap_reset() -> ()
+  //
+  // Zero the five observability counters. Called from RmRemove::
+  // remove_reset alongside the other M3+ module resets.
+  // ============================================================================
+  pub let rm_r_cap_reset : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "rm.LE-002 (rm#30) rm_r_cap_reset. Zero the five .bss counters (rmrcap_acquires_ok/_err, rmrcap_derives_ok/_err, rmrcap_cascades) so a fresh rm invocation starts baseline. Scratch buffers not scrubbed -- every field is written fresh before each nested call that reads it. xor rax,rax produces the zero constant; five lea+mov pairs write it. r11 scratch. Leaf function; no push/pop parity.",
+      block: {
+        xor rax, rax;
+        lea r11, [rip + rmrcap_acquires_ok];  mov [r11], rax;
+        lea r11, [rip + rmrcap_acquires_err]; mov [r11], rax;
+        lea r11, [rip + rmrcap_derives_ok];   mov [r11], rax;
+        lea r11, [rip + rmrcap_derives_err];  mov [r11], rax;
+        lea r11, [rip + rmrcap_cascades];     mov [r11], rax;
+        ret;
+      }
+    }
+
+  // ============================================================================
+  // rm_r_cap_wrap(target_ptr) -> u64
+  //
+  // Signature: rm_r_cap_wrap : (u64) -> u64 !{mem, sysreg} @{cap, sched}
+  // RDI (input):  target_ptr — the resolved target pointer
+  //               RmRemove::rm_remove_body's recursive dispatch arm
+  //               already computed (passed straight through to
+  //               RmWalk::walk_recursive unchanged).
+  // RAX (output): RmWalk::walk_recursive's own return code on the
+  //               happy path; RMRCAP_ERR_ACQUIRE_FAIL (1) or RMRCAP_
+  //               ERR_DERIVE_FAIL (2) if the cap scaffolding refused
+  //               before the walk ever ran (walk_blocked_by_elevate
+  //               is bumped on both refusal paths -- see file header
+  //               "Fail-closed posture").
+  //
+  // Sequence:
+  //   (1) Populate _rmrcap_acquire_mint_ctx; ElevateClient::
+  //       elevate_client_acquire(caps=0, dur=0, req_buf, reply_ep_id=0,
+  //       reply_buf, mint_ctx_buf) -> root_row_id | error.
+  //       Failure (rax >= ELCC_MAX_ROWS): bump rmrcap_acquires_err +
+  //       walk_blocked_by_elevate; return RMRCAP_ERR_ACQUIRE_FAIL
+  //       WITHOUT calling walk_recursive.
+  //   (2) Populate _rmrcap_derive_mint_ctx; ElevateClient::
+  //       elevate_client_cap_derive(root_row_id, child_caps=
+  //       ELCC_RIGHTS_ALL, child_dur_ns=RMRCAP_ROOT_DUR_NS,
+  //       mint_ctx_ptr) -> child_row_id | error.
+  //       Failure: bump rmrcap_derives_err + walk_blocked_by_elevate;
+  //       best-effort revoke_cascade(root_row_id) to release the
+  //       root grant; return RMRCAP_ERR_DERIVE_FAIL WITHOUT calling
+  //       walk_recursive.
+  //   (3) RmWalk::walk_recursive(target_ptr) -> exit_code. Preserved
+  //       across step 4 via a push/pop around the teardown call.
+  //   (4) ElevateClient::elevate_client_cap_revoke_cascade(root_row_id)
+  //       -- tears down BOTH the root grant AND the child derived at
+  //       step 2 in one call (see that function's own doc). Bumps
+  //       rmrcap_cascades regardless of the cascade's own return
+  //       (best-effort teardown; a cascade refusal is a libpdx-elevate
+  //       ELCC_ERR_CASCADE_FAIL concern this wrapper does not escalate
+  //       into rm's own exit code -- the walk already completed by
+  //       this point, successfully or not).
+  //   (5) Return the exit code stashed at step 3.
+  //
+  // Register plan (2-push + 8-byte pad; entry rsp % 16 == 8):
+  //   rbx = target_ptr        (preserved across every nested call)
+  //   r12 = root_row_id, then child_row_id is read straight from rax
+  //         at step 2 without needing its own slot (derive's return
+  //         is consumed immediately by the cmp/bump sequence; only
+  //         root_row_id needs to survive to step 4's teardown call)
+  //   r10 = mint-ctx buffer base (disjoint from r11's .bss-counter use)
+  //   r11 = lea scratch for this module's own .bss counters
+  // ============================================================================
+  pub let rm_r_cap_wrap : (u64) -> u64 !{mem, sysreg} @{cap, sched} =
+    fn (target_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.LE-002 (rm#30) rm_r_cap_wrap. Wraps RmWalk::walk_recursive with an acquire-derive-walk-cascade sequence: (1) elevate_client_acquire mints a ROOT grant scoping this one recursive invocation (mint_ctx_buf populated fresh: parent_ep_slot/request_id/requester_pid=0, target_cap_kind=ELCC_KIND_ELEVATE_CHANNEL, target_cap_rights=0 -- rm has no specific downstream capability to request here, same rationale as RmElevate::elevate_check_and_request's own mint_ctx_buf); acquire failure (rax >= ELCC_MAX_ROWS=16) bumps rmrcap_acquires_err + walk_blocked_by_elevate and returns RMRCAP_ERR_ACQUIRE_FAIL before walk_recursive ever runs (fail-closed, matching rm.ENH-004/#21's discipline for the elevate gate proper). (2) elevate_client_cap_derive(root_row_id, ELCC_RIGHTS_ALL, RMRCAP_ROOT_DUR_NS, derive_mint_ctx) mints the per-directory (per-invocation, at this milestone -- see file header) CHILD sub-cap; derive failure bumps rmrcap_derives_err + walk_blocked_by_elevate, best-effort revoke_cascades the root, and returns RMRCAP_ERR_DERIVE_FAIL, again before walk_recursive runs. (3) walk_recursive(target_ptr) runs under the derived scope; its exit code is stashed via a push/sub-8/call/add-8/pop bracket around step 4 so the teardown call's own nested CALLs see aligned rsp without clobbering the stashed value. (4) elevate_client_cap_revoke_cascade(root_row_id) tears down the WHOLE derived tree (root + the step-2 child) in one call per that function's own doc; rmrcap_cascades bumps regardless of the cascade's own return (best-effort; the walk already ran by this point). 2-push prologue (rbx=target_ptr, r12=root_row_id) + sub rsp, 8 pad = 24 bytes; entry rsp%16==8 -> post-prologue rsp%16==0 for every nested call (acquire, derive, walk_recursive, revoke_cascade). r10 stages every mint-ctx buffer base (disjoint from r11's use for this module's own .bss counters -- never live simultaneously). No `add reg, [mem]` anywhere. capabilities {cap, sched} match walk_recursive's own annotation (this wrapper adds only elevate calls, whose {cap, boot} union is already covered by {cap} here plus the shared {mem} effect; {sched} is inherited unchanged from the wrapped walk). Labels prefixed rmrcap_.",
+      block: {
+        push rbx;                              // rsp%16: 8 -> 0
+        push r12;                              // rsp%16: 0 -> 8
+        sub rsp, 8;                            // rsp%16: 8 -> 0
+
+        mov rbx, rdi;                          // rbx = target_ptr
+
+        // ---- Step 1: acquire a root grant scoping this invocation. ----
+        lea r10, [rip + _rmrcap_acquire_mint_ctx];
+        xor rax, rax;
+        mov [r10 + 0], rax;                    // parent_ep_slot = 0
+        mov [r10 + 8], rax;                    // request_id = 0
+        mov [r10 + 16], rax;                   // requester_pid = 0
+        mov rax, 0x191;                        // ELCC_KIND_ELEVATE_CHANNEL
+        mov [r10 + 24], rax;                   // target_cap_kind
+        xor rax, rax;
+        mov [r10 + 32], rax;                   // target_cap_rights = 0
+
+        xor rdi, rdi;                          // caps = 0
+        xor rsi, rsi;                          // dur = 0
+        lea rdx, [rip + _rmrcap_req_buf];      // req_buf
+        xor rcx, rcx;                          // reply_ep_id = 0
+        lea r8, [rip + _rmrcap_reply_buf];     // reply_buf
+        lea r9, [rip + _rmrcap_acquire_mint_ctx]; // mint_ctx_buf
+        call elevate_client_acquire;
+
+        cmp rax, 16;                           // ELCC_MAX_ROWS
+        jae rmrcap_acquire_fail;
+
+        mov r12, rax;                          // r12 = root_row_id
+        lea r11, [rip + rmrcap_acquires_ok];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- Step 2: derive the per-directory (per-invocation) child. --
+        lea r10, [rip + _rmrcap_derive_mint_ctx];
+        xor rax, rax;
+        mov [r10 + 0], rax;                    // parent_ep_slot = 0
+        mov [r10 + 8], rax;                    // request_id = 0
+        mov [r10 + 16], rax;                   // requester_pid = 0
+
+        mov rdi, r12;                          // parent_row_id = root
+        mov rsi, 0x418;                        // child_caps = ELCC_RIGHTS_ALL
+        mov rdx, 5000000000;                   // child_dur_ns = RMRCAP_ROOT_DUR_NS
+        lea rcx, [rip + _rmrcap_derive_mint_ctx]; // mint_ctx_ptr
+        call elevate_client_cap_derive;
+
+        cmp rax, 16;
+        jae rmrcap_derive_fail;
+
+        lea r11, [rip + rmrcap_derives_ok];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // ---- Step 3: run the walk under the derived sub-cap's scope. ---
+        mov rdi, rbx;                          // target_ptr
+        call walk_recursive;
+        // rax carries walk_recursive's exit code across the teardown.
+
+        // ---- Step 4: teardown -- one cascade call tears down BOTH the
+        //      root grant and the step-2 derived child. ------------------
+        push rax;                              // preserve walk's exit code
+        sub rsp, 8;                            // alignment for the cascade call
+        mov rdi, r12;                          // root_row_id
+        call elevate_client_cap_revoke_cascade;
+        lea r11, [rip + rmrcap_cascades];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        add rsp, 8;
+        pop rax;                               // restore walk's exit code
+
+        jmp rmrcap_out;
+
+      rmrcap_derive_fail:
+        lea r11, [rip + rmrcap_derives_err];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Best-effort teardown of the root grant even though derive
+        // itself refused -- the root was still successfully acquired
+        // at step 1 and must not be left dangling.
+        mov rdi, r12;                          // root_row_id
+        call elevate_client_cap_revoke_cascade;
+        lea r11, [rip + rmrcap_cascades];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        // Fail-closed (rm.ENH-004/#21 discipline): bump the SAME
+        // counter rm_remove_body's EACCES gate reads, then skip
+        // walk_recursive entirely -- no cap, no walk.
+        lea r11, [rip + walk_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        mov rax, 2;                            // RMRCAP_ERR_DERIVE_FAIL
+        jmp rmrcap_out;
+
+      rmrcap_acquire_fail:
+        lea r11, [rip + rmrcap_acquires_err];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+
+        lea r11, [rip + walk_blocked_by_elevate];
+        mov rax, [r11];
+        add rax, 1;
+        mov [r11], rax;
+        mov rax, 1;                            // RMRCAP_ERR_ACQUIRE_FAIL
+        // fallthrough
+
+      rmrcap_out:
+        add rsp, 8;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+}

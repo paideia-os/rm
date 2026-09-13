@@ -16,31 +16,67 @@
 // The M3-004 detector at start-of-remove:
 //   * scans the target path bytes for a "/system/" prefix (byte-by-
 //     byte compare via the paideia-as #1248 mitigation);
-//   * on prefix match, calls ElevateClient::elevate_client_request
-//     with (caps = 0, dur = 0, req_buf = &_elevate_req_buf,
-//     reply_buf = &_elevate_reply_buf);
-//   * on ELVC_STUB (0xFFFFEA00 = the M1 broker's happy path) or
-//     ELVC_OK (0 = the M2+ approved path) returns 0 (proceed);
-//   * on any other return code returns 1 (blocked).
+//   * on prefix match, dispatches through the LE-001 (rm#29)
+//     acquire+require pair (see below);
+//   * on a valid handle whose per-op re-assert also succeeds, returns
+//     0 (proceed); on any refusal at either step, returns 1 (blocked).
 //
-// The "cross-subtree" detector is scheduled at M4 alongside the
-// invoker's home-subtree resolver (KIND_USER.home_root cap-tail);
-// M3-004 lands only the /system/ detector. This mirrors mv.M3-004's
-// scheduling: the /system/ prefix is a compile-time constant, the
-// home-root is a runtime cap-tail read that needs the user substrate
-// M4 wire-up.
+// LE-001 (rm#29): elevate_client_request -> elevate_client_acquire
+// + elevate_client_require
+// ------------------------------------------------------------------
+// rm shipped through v1.2.0 calling `ElevateClient::elevate_client_
+// request(caps=0, dur=0, req_buf, reply_buf)`. libpdx-elevate.ENH-005
+// (#12) RENAMED that four-arg entry point to `elevate_client_request_
+// norealize` (see that library's elevate_client.pdx file header, "WHY
+// THE RENAME") — the bare symbol `elevate_client_request` has not
+// existed since that rename landed, so this call site has been
+// referencing a retired name. This is also the exact scenario
+// libpdx-elevate's own ENH-001 finding narrates as motivation for the
+// acquire/require API ("an advisory boolean, not a credential" — "the
+// `rm -r` regression that motivated this audit"): a boolean proceed/
+// blocked answer with nothing downstream forced to consume what the
+// elevate hop produced. Rather than re-point at the renamed twin
+// (which would merely restore the OLD advisory-boolean shape),
+// elevate_check_and_request now composes:
+//
+//   (1) ElevateClient::elevate_client_acquire(caps=0, dur=0, req_buf=
+//       &_elevate_req_buf, reply_ep_id=0, reply_buf=&_elevate_reply_
+//       buf, mint_ctx_buf=&_elevate_mint_ctx_buf) -> row_id | error.
+//       mint_ctx_buf mints a KIND_ELEVATE_CHANNEL-kinded credential
+//       (target_cap_kind = ELCC_KIND_ELEVATE_CHANNEL, target_cap_
+//       rights = 0 — rm's /system/ gate is a proceed/blocked decision,
+//       not a delegated downstream capability, so there is no
+//       narrower target kind/rights to request). row_id < 16 (ELCC_
+//       MAX_ROWS) on success; every error is >= 0xFFFFEA00 (see
+//       elevate_client_acquire's RETURN DISCRIMINATION doc) so the
+//       single `cmp rax, 16; jae` bounded compare discriminates the
+//       two outcomes.
+//   (2) On a valid row_id, ElevateClient::elevate_client_require(
+//       row_id, needed_caps=0) -> ELCA_OK | error. rm requests no
+//       specific downstream capability bits through this gate (see
+//       (1)), so needed_caps=0 makes the subset check `(0 & granted)
+//       == 0` — trivially true whenever step (1) minted a live row;
+//       require's real job here is the freshness re-check (rejecting
+//       a row whose shadow deadline has already passed) rather than a
+//       caps-subset gate.
+//   (3) RE_PROCEED iff both calls succeed; RE_BLOCKED otherwise.
 //
 // Substrate-and-broker note
 // -------------------------
-// The svc.elevate-broker at HEAD is a SEAM STUB (R48b substrate-prep,
-// paideia-os #1627) that returns ELVB_DISPATCH_STUB for every wire
-// op. ElevateClient::elevate_client_request at libpdx-elevate.M1
-// stops one step short of the endpoint invoke and returns ELVC_STUB
-// (0xFFFFEA00) on the happy path. RmElevate treats ELVC_STUB as
-// "elevate would be requested; substrate stub → proceed"; the M3 →
-// substrate transition strengthens this to "elevate requires a live
-// human APR → block until reply". Same "faithfully emit shape without
-// inventing outcome" discipline the M2 skeleton observes.
+// The svc.elevate-broker's liveness at HEAD is whatever
+// elevate_client_lookup_broker's underlying sys_svc_lookup (R20b,
+// sysno 43) reports. A test harness or boot witness with no broker
+// service registered sees elevate_client_acquire's composed chain
+// (request_ex_r -> request_ex_j -> request_ex -> lookup_broker) fail
+// closed with an ELVC_ERR_LOOKUP_FAIL-shaped code well before any
+// journal or mint step runs — RE_BLOCKED, not the old ELVC_STUB
+// "seam stub -> proceed" shortcut `elevate_client_request_norealize`
+// used to take. This is the intended posture: the LE-001 migration
+// retires the permissive stub-shaped proceed for /system/ targets in
+// favour of failing closed exactly like the rest of the D4 gate is
+// supposed to. tests/rm_elevate_smoke.pdx Scenario B was updated in
+// the same commit to assert RE_BLOCKED for a /system/-prefixed target
+// against a bare (no-broker) harness — see that file's own note.
 //
 // paideia-as compliance
 // ---------------------
@@ -83,33 +119,55 @@ module Elevate = structure {
   pub let RE_PROCEED : u64 = 0
   pub let RE_BLOCKED : u64 = 1
 
-  // Mirrored from libpdx-elevate/src/elevate_client.pdx (ELVC_STUB +
-  // ELVC_OK). Duplicated here so this module compiles standalone; the
-  // shared-lib promotion is a §5 wave concern (see plan doc §5.14
-  // libpdx-elevate M3).
+  // Retained for source-compat / historical reference only. ELVC_OK
+  // (0) is still a live libpdx-elevate convention (elevate_client_
+  // require's own success code). ELVC_STUB is the RETIRED seam-stub
+  // sentinel elevate_client_request_norealize (the renamed twin of
+  // the retired elevate_client_request) still returns on its own
+  // permissive path; LE-001 (rm#29) no longer calls that function
+  // from this module, so ELVC_STUB is no longer matched against
+  // anywhere below.
   pub let ELVC_OK   : u64 = 0
   pub let ELVC_STUB : u64 = 0xFFFFEA00
 
+  // LE-001 (rm#29): kind constant for the mint_ctx_buf's target_cap_
+  // kind slot. Mirrors libpdx-elevate ElevateClientCap::ELCC_KIND_
+  // ELEVATE_CHANNEL (0x191) — rm's /system/ gate mints a channel-only
+  // credential, not a delegated downstream capability (see the file
+  // header LE-001 section for why target_cap_rights stays 0).
+  pub let ELCC_KIND_ELEVATE_CHANNEL : u64 = 0x191
+  pub let ELCC_MAX_ROWS             : u64 = 16
+
   // -- .bss scratch buffers + observability slots -----------------------
   //
-  // The M1 ElevateClient::elevate_client_request writes an ELV REQ
-  // frame into req_buf. At HEAD the REQ frame size is bounded by
-  // ELV_REQ_FRAME_BYTES (typically ≤ 256B per the R48.M7 elevate_
-  // channel wire); a 256-byte buffer (32 u64 lanes) is more than
-  // enough for both req_buf and reply_buf.
+  // req_buf / reply_buf carry the REQ/APR frame the acquire flow's
+  // ElevateClient::elevate_client_request_ex_r composes internally;
+  // 256 bytes (32 u64 lanes) matches ELV_REQ_FRAME_BYTES's bound.
+  //
+  // _elevate_mint_ctx_buf (LE-001, rm#29) is the 40-byte / 5-word
+  // scratch elevate_client_acquire reads its mint arguments from (see
+  // that function's file-header layout table): [+0] parent_ep_slot,
+  // [+8] request_id, [+16] requester_pid, [+24] target_cap_kind,
+  // [+32] target_cap_rights. elevate_check_and_request populates it
+  // fresh on every /system/-prefix match (parent_ep_slot / request_id
+  // / requester_pid all 0 — rm has no per-call caller-supplied
+  // identity to thread through this ambient gate; target_cap_kind =
+  // ELCC_KIND_ELEVATE_CHANNEL; target_cap_rights = 0).
   //
   // elevate_scanned_count       — number of elevate_check_and_request
   //                                calls. Equals removed_count (every
   //                                target scan increments).
   // elevate_needed_count        — number of /system/-prefix matches.
-  // elevate_ok_count            — successful elevate calls
-  //                                (ELVC_STUB or ELVC_OK).
-  // elevate_err_count           — refused elevate calls (any other rc).
-  // elevate_last_ret            — most recent elevate_client_request
-  //                                return code (M4 inspects to
-  //                                distinguish ELVC_STUB from ELVC_OK).
-  pub let mut _elevate_req_buf     : [u64; 32] = uninit @align(8)
-  pub let mut _elevate_reply_buf   : [u64; 32] = uninit @align(8)
+  // elevate_ok_count            — successful elevate calls (acquire +
+  //                                require both returned OK).
+  // elevate_err_count           — refused elevate calls (acquire or
+  //                                require returned a non-OK code).
+  // elevate_last_ret            — most recent acquire-or-require
+  //                                return code (whichever step ran
+  //                                last on this call).
+  pub let mut _elevate_req_buf       : [u64; 32] = uninit @align(8)
+  pub let mut _elevate_reply_buf     : [u64; 32] = uninit @align(8)
+  pub let mut _elevate_mint_ctx_buf  : [u64; 5]  = uninit @align(8)
   pub let mut elevate_scanned_count : u64      = uninit @align(8)
   pub let mut elevate_needed_count  : u64      = uninit @align(8)
   pub let mut elevate_ok_count      : u64      = uninit @align(8)
@@ -175,10 +233,10 @@ module Elevate = structure {
   // Byte-load discipline (#1248 mitigation): xor rax, rax; mov_b rax,
   // [rbx + rcx]. Prefix byte compares in cmp rax, imm8 form.
   // ============================================================================
-  pub let elevate_check_and_request : (u64) -> u64 !{mem} @{} =
+  pub let elevate_check_and_request : (u64) -> u64 !{mem} @{cap, boot} =
     fn (target_ptr: u64) -> unsafe {
-      effects: {mem}, capabilities: {},
-      justification: "rm.M3-004 elevate_check_and_request. Byte-by-byte prefix compare target_ptr[0..8] against SYSTEM_PREFIX '/system/'; on match dispatch ElevateClient::elevate_client_request with the two scratch buffers as REQ / reply carriers. 1-push prologue (rbx=target_ptr) preserves target across the 8-byte scan and the nested elevate_client_request call, and keeps rsp%16 == 0 for the call. Byte loads use the #1248 mitigation (xor rax,rax; mov_b rax,[ptr]). Prefix bytes are all ≤ 0x7F so cmp reg,imm8 forms are safe. Loop counter compared against 8 (SYSTEM_PREFIX_LEN, imm8-safe). ELVC_STUB (0xFFFFEA00) exceeds imm32's 0x7FFFFFFF window so it is staged in r10 via mov r10, imm64 for the compare (paideia-as r11 imm64 sweep pattern; r10 chosen over r11 because r11 is holding the .bss lea base at that point). All other immediates ≤ 8 fit imm8. Classification: ELVC_OK (0) or ELVC_STUB (0xFFFFEA00) → RE_PROCEED + ok_count bump; any other rc → RE_BLOCKED + err_count bump. Return: pop rbx, ret with rax carrying the discriminant. r11 uses: SYSTEM_PREFIX lea, .bss slot leas, sequential; never overlaps with the r10 imm64 stage.",
+      effects: {mem}, capabilities: {cap, boot},
+      justification: "rm.LE-001 (rm#29) elevate_check_and_request. Byte-by-byte prefix compare target_ptr[0..8] against SYSTEM_PREFIX '/system/'; on match, populate _elevate_mint_ctx_buf then dispatch ElevateClient::elevate_client_acquire(caps=0, dur=0, req_buf, reply_ep_id=0, reply_buf, mint_ctx_buf) followed -- on a valid row_id -- by ElevateClient::elevate_client_require(row_id, needed_caps=0). This replaces the retired elevate_client_request (renamed elevate_client_request_norealize at libpdx-elevate ENH-005, #12; the bare symbol this module used to call has not existed since that rename). 1-push prologue (rbx=target_ptr) preserves target across the 8-byte scan and the two nested calls, keeping rsp%16 == 0 at both call sites (entry rsp%16==8, one push -> 0). Byte loads use the #1248 mitigation (xor rax,rax; mov_b rax,[ptr]). Prefix bytes are all <= 0x7F so cmp reg,imm8 forms are safe. Loop counter compared against 8 (SYSTEM_PREFIX_LEN, imm8-safe). Every register used to marshal the mint_ctx_buf / acquire / require argument lists (rax, rcx, rdx, rdi, rsi, r8, r9, r10) is dead from the completed prefix-scan loop at this point, so no extra callee-save is needed beyond rbx. Classification: elevate_client_acquire returning a row_id (rax < ELCC_MAX_ROWS=16, staged as an imm8 compare) AND the subsequent elevate_client_require returning ELCA_OK (rax==0) -> RE_PROCEED + ok_count bump; an acquire failure (rax >= 16, every error code is >= 0xFFFFEA00 per that function's RETURN DISCRIMINATION doc) OR a require refusal -> RE_BLOCKED + err_count bump, with no require call attempted after an acquire failure (no valid row_id to re-assert). capabilities {cap, boot} propagate from elevate_client_acquire (mint) and elevate_client_require (cap_check_and_revoke's hpet_now_ns chain). Return: pop rbx, ret with rax carrying the discriminant. r11/r10 uses: SYSTEM_PREFIX lea, .bss slot leas, mint_ctx_buf base -- sequential, no overlap with the SysV arg registers used for the two nested calls.",
       block: {
         push rbx;                              // rsp%16: 8 → 0
         mov rbx, rdi;                          // rbx = target_ptr
@@ -225,28 +283,57 @@ module Elevate = structure {
         add rax, 1;
         mov [r11], rax;
 
-        // ElevateClient::elevate_client_request(caps=0, dur=0,
-        //   req_buf=&_elevate_req_buf, reply_buf=&_elevate_reply_buf).
+        // LE-001 (rm#29): populate _elevate_mint_ctx_buf (5 words / 40
+        // bytes) ahead of the acquire call. parent_ep_slot / request_id
+        // / requester_pid all 0 (see file header); target_cap_kind =
+        // ELCC_KIND_ELEVATE_CHANNEL; target_cap_rights = 0.
+        lea r10, [rip + _elevate_mint_ctx_buf];
+        xor rax, rax;
+        mov [r10 + 0], rax;                    // parent_ep_slot = 0
+        mov [r10 + 8], rax;                    // request_id = 0
+        mov [r10 + 16], rax;                   // requester_pid = 0
+        mov rax, 0x191;                        // ELCC_KIND_ELEVATE_CHANNEL
+        mov [r10 + 24], rax;                   // target_cap_kind
+        xor rax, rax;
+        mov [r10 + 32], rax;                   // target_cap_rights = 0
+
+        // ElevateClient::elevate_client_acquire(caps=0, dur=0,
+        //   req_buf=&_elevate_req_buf, reply_ep_id=0,
+        //   reply_buf=&_elevate_reply_buf, mint_ctx_buf=&_elevate_
+        //   mint_ctx_buf) -> row_id | error.
         xor rdi, rdi;                          // caps = 0
         xor rsi, rsi;                          // dur = 0
         lea rdx, [rip + _elevate_req_buf];     // req_buf
-        lea rcx, [rip + _elevate_reply_buf];   // reply_buf
-        call elevate_client_request;
+        xor rcx, rcx;                          // reply_ep_id = 0
+        lea r8, [rip + _elevate_reply_buf];    // reply_buf
+        lea r9, [rip + _elevate_mint_ctx_buf]; // mint_ctx_buf
+        call elevate_client_acquire;
 
-        // Snapshot return, classify.
         lea r11, [rip + elevate_last_ret];
         mov [r11], rax;
 
-        // ELVC_OK (0) → PROCEED. Check first, fast path.
+        // row_id valid iff rax < ELCC_MAX_ROWS (16); every error code
+        // is >= 0xFFFFEA00 (elevate_client_acquire's RETURN
+        // DISCRIMINATION). No valid row_id -> nothing to re-assert.
+        cmp rax, 16;
+        jae re_blocked;
+
+        // ElevateClient::elevate_client_require(row_id, needed_caps=0)
+        // -> ELCA_OK | error. rm requests no specific downstream caps
+        // through this gate (see file header); the call still performs
+        // the freshness re-check against the row's shadow deadline.
+        mov rdi, rax;                          // row_id
+        xor rsi, rsi;                          // needed_caps = 0
+        call elevate_client_require;
+
+        lea r11, [rip + elevate_last_ret];
+        mov [r11], rax;
+
         cmp rax, 0;
-        je re_ok;
+        jne re_blocked;
+        jmp re_ok;
 
-        // ELVC_STUB (0xFFFFEA00, exceeds imm32) → PROCEED. Stage in r10.
-        mov r10, 0xFFFFEA00;                   // ELVC_STUB
-        cmp rax, r10;
-        je re_ok;
-
-        // Any other rc → BLOCKED.
+      re_blocked:
         lea r11, [rip + elevate_err_count];
         mov rax, [r11];
         add rax, 1;

@@ -25,8 +25,13 @@
 //
 //   Scenario B -- /system/-prefixed target:
 //     TARGET_B = "/system/etc/hosts\0"
-//     Expect: elevate_check_and_request returns RE_PROCEED (0)
-//             (M3-004 broker returns ELVC_STUB → proceed by design)
+//     Expect: elevate_check_and_request returns RE_BLOCKED (1)
+//             (rm.LE-001/#29: the retired ELVC_STUB "seam stub ->
+//             proceed" shortcut is gone; elevate_client_acquire's
+//             composed request_ex_r/_ex_j/_ex/lookup_broker chain
+//             fails closed against a bare harness with no broker
+//             service registered -- see elevate.pdx's own LE-001
+//             note for the full rationale)
 //             AND elevate_needed_count == 1  (scan matched prefix)
 //             AND elevate_scanned_count == 2 (bumped again)
 //
@@ -46,14 +51,18 @@
 //
 // Substrate-and-broker note
 // -------------------------
-// libpdx-elevate.M1's svc.elevate-broker is a seam stub that returns
-// ELVC_STUB (0xFFFFEA00) for every wire op. RmElevate classifies
-// ELVC_STUB → RE_PROCEED — that is the current design contract, not
-// a test-side bypass. The regression asserts the contract's shape
-// (scan happened + classification correct) rather than a live human
-// APR outcome. When the M3 → substrate transition rewires the broker
-// to a live approver, Scenario B's expected return flips to
-// RE_BLOCKED (1) unless the fixture pre-installs an approval; the
+// rm.LE-001 (rm#29) retired RmElevate::elevate_check_and_request's
+// call to the (by-then-renamed-out-from-under-it) elevate_client_
+// request stub in favour of ElevateClient::elevate_client_acquire +
+// elevate_client_require. Against a bare test harness with no broker
+// service registered, elevate_client_acquire's composed request_ex_r
+// -> request_ex_j -> request_ex -> lookup_broker chain fails closed
+// with an ELVC_ERR_LOOKUP_FAIL-shaped code well before any mint step
+// runs, so Scenario B now expects RE_BLOCKED (1) — this is the
+// INTENDED posture the migration exists to land (fail closed, not
+// the old permissive "seam stub -> proceed" shortcut). This flips
+// automatically to a live-approver-driven outcome once a real broker
+// is registered in the boot environment this harness runs under; the
 // header stays otherwise unchanged.
 //
 // paideia-as compliance
@@ -114,7 +123,7 @@ module RmElevateSmoke = structure {
   pub let rm_elevate_smoke_run : () -> u64 !{mem, sysreg} @{fs} =
     fn () -> unsafe {
       effects: {mem, sysreg}, capabilities: {fs},
-      justification: "rm.ENH-010 rm_elevate_smoke_run (paideia-os/rm#24). Three-scenario regression pin for RmElevate::elevate_check_and_request against the ENH-001 (#18) recursive-branch bypass and the ENH-002 (#19) unresolved-argv compare. (A) non-/system/ target → RE_PROCEED, no counter bump on `needed`; (B) /system/-prefixed target → RE_PROCEED (ELVC_STUB stubs it) AND `needed` bumps to 1; (C) /systemic/ non-match guard → RE_PROCEED AND `needed` stays at 1 (regression pin against a boundary-substring conflation). Each scenario also asserts elevate_scanned_count grew by 1. Prologue: 1-push (rbx = failure latch), entry rsp%16 == 8 → post-push rsp%16 == 0 for every nested call (elevate_reset + three elevate_check_and_request + sys_write for the fingerprint). rbx is SysV callee-save; the nested calls preserve it. Fail path prints the FAIL fingerprint and returns 1; success prints OK and returns 0. Emitting the fingerprint on fd 2 (stderr) matches tests/expected-m4-fingerprints.txt convention. All cmp immediates ≤ 3. r11 scratch for every .bss lea (elevate_needed_count / elevate_scanned_count / return-value stash); reloaded before every read. Labels prefixed `res_` for scenario boundaries and `rf_` for the shared fingerprint sink.",
+      justification: "rm.ENH-010 rm_elevate_smoke_run (paideia-os/rm#24), updated at rm.LE-001 (#29). Three-scenario regression pin for RmElevate::elevate_check_and_request against the ENH-001 (#18) recursive-branch bypass and the ENH-002 (#19) unresolved-argv compare. (A) non-/system/ target → RE_PROCEED, no counter bump on `needed`; (B) /system/-prefixed target → RE_BLOCKED (LE-001/#29: elevate_client_acquire fails closed against a bare no-broker harness -- the retired ELVC_STUB seam-stub shortcut is gone) AND `needed` bumps to 1; (C) /systemic/ non-match guard → RE_PROCEED AND `needed` stays at 1 (regression pin against a boundary-substring conflation). Each scenario also asserts elevate_scanned_count grew by 1. Prologue: 1-push (rbx = failure latch), entry rsp%16 == 8 → post-push rsp%16 == 0 for every nested call (elevate_reset + three elevate_check_and_request + sys_write for the fingerprint). rbx is SysV callee-save; the nested calls preserve it. Fail path prints the FAIL fingerprint and returns 1; success prints OK and returns 0. Emitting the fingerprint on fd 2 (stderr) matches tests/expected-m4-fingerprints.txt convention. All cmp immediates ≤ 3. r11 scratch for every .bss lea (elevate_needed_count / elevate_scanned_count / return-value stash); reloaded before every read. Labels prefixed `res_` for scenario boundaries and `rf_` for the shared fingerprint sink.",
       block: {
         push rbx;
         xor rbx, rbx;                          // failure latch = 0
@@ -146,9 +155,10 @@ module RmElevateSmoke = structure {
 
       res_b_head:
         // ================ Scenario B: /system/-prefixed =================
+        // rm.LE-001 (rm#29): expect RE_BLOCKED (1) -- see file header.
         lea rdi, [rip + TARGET_B];
         call elevate_check_and_request;
-        cmp rax, 0;
+        cmp rax, 1;
         jne res_b_fail;
 
         lea r11, [rip + elevate_scanned_count];

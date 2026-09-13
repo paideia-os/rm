@@ -33,3 +33,9 @@
 # RmGolden::rm_golden_run emits this canonical marker last. Absence is
 # a hard fail (runner truncation) even when every OK line above matched.
 [rm.ENH-010 GOLDEN OK]
+
+# rm.ENH-004 (paideia-os/rm#21) addition.
+# RmSecurityFailClosed::rm_security_fail_closed_run emits exactly one
+# of these two lines; asserts rm_remove_body returns EXIT_EACCES (13)
+# on a blocked /system/ removal instead of the pre-fix EXIT_OK.
+[rm.ENH-004 OK]

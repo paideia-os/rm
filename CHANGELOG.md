@@ -5,6 +5,60 @@ Every rm release follows semver (design/tooling/plan.md §D4). The
 design/tooling/r49-r50-plan.md §5.8); every subsequent entry adds one
 line to the top under the same shape.
 
+## 1.3.0 — 2026-09-13
+
+Wave N drain: rm#21, rm#29, rm#30, rm#31. One security fix
+(fail-closed exit code on a blocked removal), the LE-001 migration
+off a retired libpdx-elevate symbol, cap_derive/revoke_cascade
+adoption for the recursive branch, and the R90 PdxFS-TXN trampoline
+module.
+
+### Landed
+
+- **rm#21 (ENH-004) — SECURITY: fail-closed exit code.** A removal
+  refused by `RmElevate::elevate_check_and_request` or `RmResolve::
+  resolve_target` used to fall through `RmRemove::rm_remove_body`'s
+  loop and still return `EXIT_OK` (0) — fail-OPEN reporting. The loop
+  now checks `rm_blocked_by_elevate + walk_blocked_by_elevate` after
+  every positional is processed and returns `EXIT_EACCES` (13) when
+  either is non-zero; every block site (resolve-fail, recursive-
+  blocked, non-recursive-blocked) also emits `[rm.ENH-004 EACCES
+  blocked]` on stderr. New fixture `tests/rm_security_fail_closed.pdx`
+  drives `rm_remove_body` end-to-end against a `/system/`-prefixed
+  absolute target and asserts both the exit code and the counter.
+- **rm#29 (LE-001) — migrate off the retired `elevate_client_
+  request`.** libpdx-elevate.ENH-005 renamed `elevate_client_request`
+  to `elevate_client_request_norealize`; rm's only call site (`RmElevate
+  ::elevate_check_and_request`) had been calling the now-nonexistent
+  bare symbol. Replaced with `elevate_client_acquire` (mints a row_id
+  scoped by a fresh `_elevate_mint_ctx_buf`) followed by
+  `elevate_client_require(row_id, needed_caps=0)`. This retires the
+  old ELVC_STUB "seam-stub → proceed" shortcut in favour of failing
+  closed when no broker is reachable — `tests/rm_elevate_smoke.pdx`
+  Scenario B updated to expect `RE_BLOCKED` accordingly.
+- **rm#30 (LE-002) — cap_derive + revoke_cascade for `-r`.** New
+  `RmRCap` module (`src/rm_r_cap.pdx`) wraps `RmWalk::walk_recursive`:
+  acquires a root elevate grant scoping the invocation, derives a
+  per-directory (per-invocation, pending the R42 live-readdir landing)
+  child sub-cap via `elevate_client_cap_derive`, runs the walk, then
+  tears the whole derived tree down with one `elevate_client_cap_
+  revoke_cascade(root)` call. A cap-scaffolding refusal bumps `RmWalk::
+  walk_blocked_by_elevate` and skips the walk entirely, tying into the
+  rm#21 fail-closed exit code. Wired into `rm_remove_body`'s recursive
+  dispatch arm in place of the direct `walk_recursive` call; `rm_r_cap_
+  reset` added to `remove_reset`'s delegation list.
+- **rm#31 (R90) — PdxFS-TXN trampolines.** New `src/pdxfs_txn.pdx`
+  (`PdxfsTxn` module) with `pdxfs_txn_begin/add_unlink/commit/abort`
+  wired to the real landed sysnos (70/107/104/105 per design/user/
+  syscall-table.md — the wave dispatch's cited 108/109/110 were a
+  mismatch with the unrelated R105 display/framebuffer band, corrected
+  in the file header) plus `pdxfs_txn_status/free` STUBs (no row-query
+  or `sys_pdxfs_txn_close` syscall exists yet). Trampolines only at
+  this landing — wiring `rm_process_one` / `walk_recursive`'s existing
+  direct unlink/rmdir call sites onto a TXN-wrapped sequence is a
+  follow-up body edit, same posture mv's own `src/pdxfs.pdx` split
+  already establishes.
+
 ## 1.2.0 — 2026-09-13
 
 Wave F drain: single implementation pass closing the five remaining

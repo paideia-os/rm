@@ -1,0 +1,148 @@
+// tests/rm_security_fail_closed.pdx -- rm.ENH-004 (rm#21)
+// RmSecurityFailClosed module: fail-closed exit-code regression.
+//
+// Scope
+// -----
+// rm.ENH-004 (#21) is a SECURITY finding: prior to this fix, a
+// removal blocked by RmElevate::elevate_check_and_request (or refused
+// at RmResolve::resolve_target) fell through RmRemove::rm_remove_
+// body's loop and the function still returned EXIT_OK (0) uncondi-
+// tionally -- a caller (or a script checking $?) had no signal that
+// anything was refused. This is fail-OPEN reporting: the removal
+// itself was correctly skipped, but the process exit code lied about
+// it.
+//
+// This module drives RmRemove::rm_remove_body end-to-end (not just
+// the elevate gate in isolation, which tests/rm_elevate_smoke.pdx
+// already covers) against a /system/-prefixed absolute target, and
+// asserts BOTH halves of the fix:
+//
+//   (1) the process-level exit code is EXIT_EACCES (13), not EXIT_OK;
+//   (2) RmRemove::rm_blocked_by_elevate bumped exactly once, so the
+//       exit code is driven by a real observed refusal and not a
+//       coincidental non-zero return from an unrelated path.
+//
+// Deterministic rejection without a live broker
+// -----------------------------------------------
+// TARGET = "/system/etc/shadow" is an ABSOLUTE path, so RmResolve::
+// resolve_target takes its fast path (argv[0] == '/' -> returns
+// argv_ptr verbatim, no sys_getcwd call -- see resolve.pdx's own
+// Contract section) and this fixture needs no cwd setup. The /system/
+// prefix then triggers RmElevate::elevate_check_and_request's
+// elevate_client_acquire dispatch (rm.LE-001, #29); against a bare
+// test harness with no elevate-broker service registered, that call
+// fails closed (ELVC_ERR_LOOKUP_FAIL-shaped, RE_BLOCKED) well before
+// any human-APR wait -- see elevate.pdx's own LE-001 note and tests/
+// rm_elevate_smoke.pdx's Scenario B for the same substrate reasoning.
+// This makes the rejection reproducible in-process with no mocking.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmSecurityFailClosed (PascalCase basename matches file
+//     stem after the numeric-prefix strip rule -- none here).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm <= 0x7FFFFFFF (max: 13 for the EXIT_EACCES
+//     check).
+//   - r11 is scratch for every .bss lea (ParsedArgs::pos_ptrs /
+//     pos_count, RmFlags::flag_r, RmRemove::rm_blocked_by_elevate).
+//   - No byte reads (every check is a qword-wide compare).
+//   - 1-push prologue (rbx = failure latch) keeps rsp % 16 == 0 at
+//     every nested call site (entry rsp%16==8, one push -> 0);
+//     matches tests/rm_elevate_smoke.pdx's own shape.
+//   - Labels prefixed `fc_` (paideia-as reserved-label discipline).
+
+module RmSecurityFailClosed = structure {
+
+  // Absolute /system/-prefixed target. 19 bytes incl. trailing NUL.
+  pub let TARGET     : [u8; 19] = "/system/etc/shadow\0"
+  pub let TARGET_LEN : u64      = 18
+
+  // -- Fingerprint markers -----------------------------------------------
+  pub let OK_MSG     : [u8; 16] = "[rm.ENH-004 OK]\n"
+  pub let OK_MSG_LEN : u64      = 16
+
+  pub let FAIL_MSG     : [u8; 18] = "[rm.ENH-004 FAIL]\n"
+  pub let FAIL_MSG_LEN : u64      = 18
+
+  // ============================================================================
+  // rm_security_fail_closed_run() -> u64
+  //
+  // Returns 0 on clean pass, 1 on assertion failure. Emits the
+  // matching fingerprint line on fd 2 (stderr), same convention as
+  // tests/rm_elevate_smoke.pdx.
+  //
+  // Register plan:
+  //   rbx = failure latch (0 on entry; set to 1 on the first failed
+  //         assertion, preserved across the fingerprint dispatch).
+  // ============================================================================
+  pub let rm_security_fail_closed_run : () -> u64 !{mem, sysreg} @{cap, sched} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {cap, sched},
+      justification: "rm.ENH-004 (rm#21) rm_security_fail_closed_run. End-to-end fixture for the fail-closed exit-code fix: installs a synthetic ParsedArgs window (pos_ptrs[0] = &TARGET, pos_count = 1) and zeroes RmFlags::flag_r (non-recursive branch), then drives RmRemove::remove_reset -> RmFlags::flags_reset -> RmRemove::rm_remove_body(&TARGET) directly (same synthetic-fixture discipline as tests/m4_001_txn_abort.pdx and tests/m4_005_unknown_flag_reject.pdx). TARGET's absolute leading '/' takes RmResolve::resolve_target's fast path (no sys_getcwd call, see resolve.pdx's Contract section), so the fixture needs no cwd setup; the /system/ prefix then routes through RmElevate::elevate_check_and_request's rm.LE-001 (#29) elevate_client_acquire dispatch, which fails closed against a bare no-broker test harness (see tests/rm_elevate_smoke.pdx Scenario B for the identical substrate reasoning). Two assertions: (1) rm_remove_body's return must equal 13 (EXIT_EACCES) -- the ENH-004 fix under test; (2) RmRemove::rm_blocked_by_elevate must have bumped to exactly 1, confirming the exit code is driven by the observed refusal rather than an unrelated non-zero return. 1-push prologue (rbx = failure latch) keeps rsp%16 == 0 at every nested call (remove_reset, flags_reset, rm_remove_body, and the fd-2 sys_write for the fingerprint) -- entry rsp%16==8, one push -> 0, matching tests/rm_elevate_smoke.pdx's own shape. rbx is SysV callee-save; every nested call preserves it. Fail path prints FAIL and returns 1; success prints OK and returns 0. All cmp immediates <= 13. r11 scratch for every .bss lea, reloaded before each use. Labels prefixed `fc_`.",
+      block: {
+        push rbx;                              // rsp%16: 8 -> 0
+        xor rbx, rbx;                          // failure latch = 0
+
+        // ---- Reset to a known baseline. ---------------------------------
+        call remove_reset;
+        call flags_reset;
+
+        // ---- Install the synthetic ParsedArgs window. -------------------
+        lea r11, [rip + pos_ptrs];
+        lea rax, [rip + TARGET];
+        mov [r11 + 0], rax;                    // pos_ptrs[0] = &TARGET
+        lea r11, [rip + pos_count];
+        mov rax, 1;
+        mov [r11], rax;                        // pos_count = 1
+
+        // ---- Non-recursive branch: flag_r stays 0 (flags_reset already
+        //      zeroed it; explicit re-zero documents the intent). --------
+        lea r11, [rip + flag_r];
+        xor rax, rax;
+        mov [r11], rax;
+
+        // ---- Drive the body under test. ---------------------------------
+        lea rdi, [rip + TARGET];
+        call rm_remove_body;
+
+        // ---- Assertion 1: EXIT_EACCES (13). ------------------------------
+        cmp rax, 13;
+        jne fc_fail;
+
+        // ---- Assertion 2: rm_blocked_by_elevate bumped exactly once. -----
+        lea r11, [rip + rm_blocked_by_elevate];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne fc_fail;
+
+        jmp fc_emit;
+
+      fc_fail:
+        mov rbx, 1;
+
+      fc_emit:
+        cmp rbx, 0;
+        jne fc_fail_print;
+
+        // Success: emit OK fingerprint on fd 2.
+        mov rdi, 2;
+        lea rsi, [rip + OK_MSG];
+        mov rdx, 16;                           // OK_MSG_LEN
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      fc_fail_print:
+        mov rdi, 2;
+        lea rsi, [rip + FAIL_MSG];
+        mov rdx, 18;                           // FAIL_MSG_LEN
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        mov rax, 1;
+        pop rbx;
+        ret
+      }
+    }
+}
