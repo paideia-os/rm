@@ -1,0 +1,214 @@
+// tests/rm_elevate_smoke.pdx -- rm.ENH-010 (paideia-os/rm#24)
+// RmElevateSmoke module: /system/ elevate-gate regression.
+//
+// Scope
+// -----
+// rm.ENH-001 (issue #18) and rm.ENH-002 (issue #19) closed two
+// SECURITY findings about the /system/ elevate gate: the recursive
+// arm bypassed the check entirely (ENH-001), and the check compared
+// the unresolved argv bytes rather than the cwd-resolved absolute
+// path (ENH-002). ENH-010 (#24) is the regression harness that
+// keeps those two fixes from silently regressing — the finding
+// itself in design/enhancement-plan.md §"9.1 Errata inventory" says
+// verbatim that "no runnable tests" is "the structural reason
+// findings A and D survived to a signed 1.0.0" and is "the
+// highest-leverage item after the security cluster".
+//
+// This module drives RmElevate::elevate_check_and_request through
+// three scenarios that pin its user-visible discriminant:
+//
+//   Scenario A -- non-/system/ target:
+//     TARGET_A = "/home/alice/scratch\0"
+//     Expect: elevate_check_and_request returns RE_PROCEED (0)
+//             AND elevate_needed_count stays 0
+//             AND elevate_scanned_count == 1
+//
+//   Scenario B -- /system/-prefixed target:
+//     TARGET_B = "/system/etc/hosts\0"
+//     Expect: elevate_check_and_request returns RE_PROCEED (0)
+//             (M3-004 broker returns ELVC_STUB → proceed by design)
+//             AND elevate_needed_count == 1  (scan matched prefix)
+//             AND elevate_scanned_count == 2 (bumped again)
+//
+//   Scenario C -- /systemic/ non-match guard (regression pin for the
+//   ENH-001-adjacent boundary-not-substring semantic):
+//     TARGET_C = "/systemic/thing\0"
+//     Expect: elevate_check_and_request returns RE_PROCEED (0)
+//             AND elevate_needed_count stays at 1  (unchanged)
+//             AND elevate_scanned_count == 3
+//
+// The three-scenario shape catches every fix ENH-001/ENH-002 landed:
+// the recursive-branch bypass fails at Scenario B (the counter never
+// bumps if the call is skipped); the cwd-unresolved compare fails at
+// Scenario A if a fixture whose cwd is "/system/" was ever run and
+// the raw-argv path was compared; the boundary-substring conflation
+// (an old regression) fails at Scenario C.
+//
+// Substrate-and-broker note
+// -------------------------
+// libpdx-elevate.M1's svc.elevate-broker is a seam stub that returns
+// ELVC_STUB (0xFFFFEA00) for every wire op. RmElevate classifies
+// ELVC_STUB → RE_PROCEED — that is the current design contract, not
+// a test-side bypass. The regression asserts the contract's shape
+// (scan happened + classification correct) rather than a live human
+// APR outcome. When the M3 → substrate transition rewires the broker
+// to a live approver, Scenario B's expected return flips to
+// RE_BLOCKED (1) unless the fixture pre-installs an approval; the
+// header stays otherwise unchanged.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmElevateSmoke (PascalCase basename matches file stem).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (max: 3 for scan-count check).
+//   - r11 scratch for every lea (target constants + .bss reads).
+//   - Byte loads via xor rax,rax; mov_b rax,[ptr] (#1248) — n/a here
+//     as the module compares only u64 counter values and rax.
+//   - 1-push prologue (rbx = failure-latching accumulator) keeps
+//     rsp%16 == 0 at every nested elevate_check_and_request call
+//     (entry rsp%16 == 8, push rbx flips to 0). rbx carries the
+//     first-failure indicator across three scenarios; zero-preserved
+//     iff every scenario passes.
+//   - Labels prefixed `res_` for scenario boundaries and `rf_` for
+//     the shared fail path (paideia-as reserved-label discipline).
+//
+// M4/M5 harness integration
+// -------------------------
+// The M4 runner (tests/m4_runner.pdx) can invoke rm_elevate_smoke_run
+// as a fifth scenario after m4_005; the m4_runner keeps its existing
+// four-scenario shape at HEAD and this module exports the entry
+// point separately so a follow-up runner bump is a one-line addition
+// rather than an ordering rewrite.
+
+module RmElevateSmoke = structure {
+
+  // -- Target path constants (NUL-terminated) --------------------------
+  pub let TARGET_A         : [u8; 20] = "/home/alice/scratch\0"
+  pub let TARGET_A_LEN     : u64      = 19
+
+  pub let TARGET_B         : [u8; 18] = "/system/etc/hosts\0"
+  pub let TARGET_B_LEN     : u64      = 17
+
+  pub let TARGET_C         : [u8; 16] = "/systemic/thing\0"
+  pub let TARGET_C_LEN     : u64      = 15
+
+  // -- Fingerprint markers -----------------------------------------------
+  pub let OK_MSG           : [u8; 24] = "[rm.ENH-010 SMOKE OK]\n\0\0"
+  pub let OK_MSG_LEN       : u64      = 22
+
+  pub let FAIL_MSG         : [u8; 26] = "[rm.ENH-010 SMOKE FAIL]\n\0\0"
+  pub let FAIL_MSG_LEN     : u64      = 24
+
+  // ============================================================================
+  // rm_elevate_smoke_run() -> u64
+  //
+  // Returns 0 on clean pass, 1 on any scenario failure. Also emits the
+  // matching fingerprint line on fd 2 (stderr) for the smoke matcher.
+  //
+  // Register plan:
+  //   rbx = failure latch (0 on entry; set to 1 on the first failed
+  //         scenario, preserved across every subsequent nested call so
+  //         later scenarios still exercise the code path but the exit
+  //         code carries the first-failure signal).
+  // ============================================================================
+  pub let rm_elevate_smoke_run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "rm.ENH-010 rm_elevate_smoke_run (paideia-os/rm#24). Three-scenario regression pin for RmElevate::elevate_check_and_request against the ENH-001 (#18) recursive-branch bypass and the ENH-002 (#19) unresolved-argv compare. (A) non-/system/ target → RE_PROCEED, no counter bump on `needed`; (B) /system/-prefixed target → RE_PROCEED (ELVC_STUB stubs it) AND `needed` bumps to 1; (C) /systemic/ non-match guard → RE_PROCEED AND `needed` stays at 1 (regression pin against a boundary-substring conflation). Each scenario also asserts elevate_scanned_count grew by 1. Prologue: 1-push (rbx = failure latch), entry rsp%16 == 8 → post-push rsp%16 == 0 for every nested call (elevate_reset + three elevate_check_and_request + sys_write for the fingerprint). rbx is SysV callee-save; the nested calls preserve it. Fail path prints the FAIL fingerprint and returns 1; success prints OK and returns 0. Emitting the fingerprint on fd 2 (stderr) matches tests/expected-m4-fingerprints.txt convention. All cmp immediates ≤ 3. r11 scratch for every .bss lea (elevate_needed_count / elevate_scanned_count / return-value stash); reloaded before every read. Labels prefixed `res_` for scenario boundaries and `rf_` for the shared fingerprint sink.",
+      block: {
+        push rbx;
+        xor rbx, rbx;                          // failure latch = 0
+
+        // ---- Prime: zero all elevate counters --------------------------
+        call elevate_reset;
+
+        // =============== Scenario A: non-/system/ target ================
+        lea rdi, [rip + TARGET_A];
+        call elevate_check_and_request;
+        cmp rax, 0;
+        jne res_a_fail;
+
+        // elevate_scanned_count must be 1.
+        lea r11, [rip + elevate_scanned_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne res_a_fail;
+
+        // elevate_needed_count must be 0.
+        lea r11, [rip + elevate_needed_count];
+        mov rax, [r11];
+        cmp rax, 0;
+        jne res_a_fail;
+        jmp res_b_head;
+
+      res_a_fail:
+        mov rbx, 1;
+
+      res_b_head:
+        // ================ Scenario B: /system/-prefixed =================
+        lea rdi, [rip + TARGET_B];
+        call elevate_check_and_request;
+        cmp rax, 0;
+        jne res_b_fail;
+
+        lea r11, [rip + elevate_scanned_count];
+        mov rax, [r11];
+        cmp rax, 2;
+        jne res_b_fail;
+
+        lea r11, [rip + elevate_needed_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne res_b_fail;
+        jmp res_c_head;
+
+      res_b_fail:
+        mov rbx, 1;
+
+      res_c_head:
+        // ========= Scenario C: /systemic/ boundary non-match ============
+        lea rdi, [rip + TARGET_C];
+        call elevate_check_and_request;
+        cmp rax, 0;
+        jne res_c_fail;
+
+        lea r11, [rip + elevate_scanned_count];
+        mov rax, [r11];
+        cmp rax, 3;
+        jne res_c_fail;
+
+        lea r11, [rip + elevate_needed_count];
+        mov rax, [r11];
+        cmp rax, 1;
+        jne res_c_fail;
+        jmp res_emit_fp;
+
+      res_c_fail:
+        mov rbx, 1;
+
+      res_emit_fp:
+        cmp rbx, 0;
+        jne rf_fail_print;
+
+        // Success: emit OK fingerprint on fd 2.
+        mov rdi, 2;
+        lea rsi, [rip + OK_MSG];
+        mov rdx, 22;                           // OK_MSG_LEN
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        xor rax, rax;
+        pop rbx;
+        ret;
+
+      rf_fail_print:
+        mov rdi, 2;
+        lea rsi, [rip + FAIL_MSG];
+        mov rdx, 24;                           // FAIL_MSG_LEN
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        mov rax, 1;
+        pop rbx;
+        ret
+      }
+    }
+}

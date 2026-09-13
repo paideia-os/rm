@@ -23,3 +23,13 @@
 [rm.M4-004 OK]
 [rm.M4-005 OK]
 [rm.M4-runner done]
+
+# rm.ENH-010 (paideia-os/rm#24) additions.
+# RmElevateSmoke::rm_elevate_smoke_run emits exactly one of these two
+# lines; the driver treats the FAIL line as a hard fail with the
+# scenario body printed inline for triage.
+[rm.ENH-010 SMOKE OK]
+
+# RmGolden::rm_golden_run emits this canonical marker last. Absence is
+# a hard fail (runner truncation) even when every OK line above matched.
+[rm.ENH-010 GOLDEN OK]

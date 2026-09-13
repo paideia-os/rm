@@ -1,0 +1,76 @@
+// tests/rm_golden.pdx -- rm.ENH-010 (paideia-os/rm#24)
+// RmGolden module: golden-output regression for the rm-tests target.
+//
+// Scope
+// -----
+// ENH-010's third leg (after the rm-tests build target + the elevate
+// smoke) is a golden-output regression: the smoke driver's grep-
+// substring matcher must observe an in-order set of fingerprints
+// from a single execution of the rm-tests binary. This module
+// declares the canonical corpus as a byte-exact rodata blob, emits
+// it verbatim to stderr on a run, and returns 0. The paideia-os
+// tools/run-smoke.sh matcher — driven by tests/expected-m4-
+// fingerprints.txt — sees this module's line last in the sequence,
+// pinning the runner's final-line contract.
+//
+// Why a golden-emit module (not just an assertion module)
+// -------------------------------------------------------
+// The M4-005 assertion tests already print [rm.M4-005 OK] / FAIL
+// lines the matcher picks up. What's missing is a single canonical
+// "runner-complete" marker whose absence is a hard fail — a truncated
+// runner output that prints five OKs then aborts before the marker
+// still passes today because the matcher matches the OKs in order and
+// the missing marker is treated as an ordering violation the driver
+// currently downgrades to a warning. This module lands the marker as
+// a source-of-truth byte-blob and encodes it byte-exact in the
+// expected-m4-fingerprints.txt corpus, so a truncated run fails with
+// a clean substring-not-found signal.
+//
+// paideia-as compliance
+// ---------------------
+//   - Module RmGolden (PascalCase basename matches file stem).
+//   - No test mnemonic; every zero-check via cmp reg, 0.
+//   - Every cmp reg, imm ≤ 0x7FFFFFFF (only 0 and length imm8s).
+//   - r11 scratch for rip-relative lea to the GOLDEN blob.
+//   - No push/pop needed: sys_write is a leaf syscall and the module
+//     returns rax = 0 straight from the syscall path (rax always
+//     carries the bytes-written on the fd-2 UART fast path per
+//     src/kernel/core/syscall/dispatch.pdx §sys_write).
+//   - @no_frame reflects the never-nested shape.
+//
+// Golden-line format
+// ------------------
+// The canonical marker is:
+//
+//   [rm.ENH-010 GOLDEN OK]\n
+//
+// Any prefix change (case, punctuation, trailing whitespace) is a
+// contract break: update expected-m4-fingerprints.txt in the same
+// commit or the matcher will fail to observe the marker.
+
+module RmGolden = structure {
+
+  pub let GOLDEN_MSG     : [u8; 24] = "[rm.ENH-010 GOLDEN OK]\n\0"
+  pub let GOLDEN_MSG_LEN : u64      = 23
+
+  // ============================================================================
+  // rm_golden_run() -> u64
+  //
+  // Emits the canonical marker on fd 2 (stderr; matches the M4 corpus
+  // convention). Returns 0.
+  // ============================================================================
+  pub let rm_golden_run : () -> u64 !{mem, sysreg} @{fs} =
+    fn () -> unsafe {
+      effects: {mem, sysreg}, capabilities: {fs},
+      justification: "rm.ENH-010 rm_golden_run (paideia-os/rm#24). Emits the [rm.ENH-010 GOLDEN OK]\\n marker on fd 2 via sys_write (SC+ id 1). Leaf; @no_frame — the syscall clobbers rcx/r11 via SYSRET but no callee-save state is preserved and no nested call is made. Return rax = 0 (a fixed literal loaded after the syscall so a partial write on a non-UART fd does not leak into the exit code). rdi = 2 (fd stderr), rsi = &GOLDEN_MSG, rdx = 23 (GOLDEN_MSG_LEN — excludes trailing NUL padding). All immediates ≤ 23 fit imm8. r11 free (SYSRET clobbers it; not consulted after). This module deliberately does no logic — the marker is the contract, and any body divergence would defeat the regression pin.",
+      block: {
+        mov rdi, 2;                            // fd = stderr
+        lea rsi, [rip + GOLDEN_MSG];
+        mov rdx, 23;                           // GOLDEN_MSG_LEN
+        mov rax, 1;                            // SYS_WRITE
+        syscall;
+        xor rax, rax;
+        ret
+      }
+    }
+}
